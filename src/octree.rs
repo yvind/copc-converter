@@ -1,3 +1,4 @@
+use crate::PipelineConfig;
 /// Out-of-core octree builder.
 ///
 /// Strategy
@@ -14,7 +15,6 @@
 /// 6. Produce the list of (VoxelKey, point_count) for the writer, which reads from disk.
 ///
 /// Memory usage is bounded by the configurable memory budget.
-use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
 use crate::node_store::{FileNodeStore, NodeStore, PackedNodeStore};
 use anyhow::{Context, Result};
@@ -795,6 +795,7 @@ pub fn input_to_copc_format(id: u8) -> u8 {
 }
 
 /// Per-file results from the scan phase, used by validation.
+#[derive(Debug, Clone)]
 pub struct ScanResult {
     pub bounds: Bounds,
     pub point_count: u64,
@@ -804,13 +805,11 @@ pub struct ScanResult {
     pub offset_x: f64,
     pub offset_y: f64,
     pub offset_z: f64,
-    /// Hash of the file's WKT CRS VLR (if present). Storing only a hash
-    /// keeps `ScanResult` size constant in the number of files — with
-    /// 100k+ input files and typical ~2 KB WKT strings, storing full
-    /// copies would cost hundreds of MB across the scan pass. The
-    /// canonical WKT bytes are kept separately (see `OctreeBuilder::scan`
-    /// return type) and only one copy lives through validate → write.
-    pub wkt_crs_hash: Option<u64>,
+    /// CRS kind found in the file (if any). For WKT CRS we store only a
+    /// 64-bit hash so `ScanResult` size stays constant in the number of
+    /// files — the canonical WKT bytes are kept once in `ScanOutput`. For
+    /// GeoTIFF CRS we store the EPSG code(s) directly since they are tiny.
+    pub crs: Option<CrsKind>,
     /// Parsed Extra Bytes VLR — structural fields + per-file stats.
     /// `None` when the file declares no extra bytes. Keeping the parsed
     /// form per file (a few hundred bytes per file) costs more than a
@@ -829,6 +828,17 @@ pub struct ScanResult {
     pub point_format_id: u8,
 }
 
+/// Per-file CRS identity: small enough to hold once per `ScanResult` even
+/// at 100k+ inputs. Full WKT bytes live elsewhere (see `ScanOutput`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrsKind {
+    /// Hash of the WKT CRS VLR. Used for fast file-vs-file equality
+    /// without retaining per-file WKT bytes.
+    WktHash(u64),
+    /// GeoTIFF EPSG codes: (horizontal, optional vertical).
+    GeoTiffEpsg(u16, Option<u16>),
+}
+
 /// Output of the scan pass: per-file results plus the one canonical WKT
 /// payload from the first file that had one. Downstream stages use this
 /// single copy instead of rehydrating one per file.
@@ -845,12 +855,62 @@ pub struct ScanOutput {
 /// so digests are identical across files in the same process. With 64
 /// bits and typically a single VLR per kind per run, collision risk is
 /// negligible. Used for both WKT CRS and Extra Bytes VLR identity.
-fn bytes_hash(bytes: &[u8]) -> u64 {
+pub(crate) fn bytes_hash(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
     let mut h = BuildHasherDefault::<DefaultHasher>::default().build_hasher();
     h.write(bytes);
     h.finish()
+}
+
+/// Best-effort EPSG code parse from WKT-CRS bytes.
+///
+/// Walks the trailing identifier digits at the end of the WKT (and at the
+/// end of any `VERTCRS` / `VERTICALCRS` / `VERT_CS` sub-string for the
+/// vertical component). This is not a real WKT parser; it returns `None`
+/// when no plausible EPSG code is found, leaving callers to treat the
+/// inputs as inequivalent rather than erroring out.
+pub fn get_epsg_from_wkt_crs_bytes(bytes: &[u8]) -> Option<(u16, Option<u16>)> {
+    const EPSG_RANGE: std::ops::Range<u16> = 1024..(i16::MAX as u16);
+    let wkt = String::from_utf8_lossy(bytes);
+
+    fn trailing_code(bytes: &[u8]) -> Option<u16> {
+        // EPSG codes sit at the end of the substring (e.g. `…AUTHORITY["EPSG","4326"]]`).
+        // Walk backwards collecting digits; bail if we never find any in the
+        // last ~10 bytes (codes are 4–5 digits starting 2–3 bytes from the back).
+        let mut code: u16 = 0;
+        let mut started = false;
+        let mut power: u16 = 1;
+        for byte in bytes.trim_ascii_end().iter().rev().take(10) {
+            if byte.is_ascii_digit() {
+                started = true;
+                code = code.checked_add(power.checked_mul((byte - b'0') as u16)?)?;
+                power = power.checked_mul(10)?;
+            } else if started {
+                break;
+            }
+        }
+        if started { Some(code) } else { None }
+    }
+
+    let (horizontal_part, vertical_part) = if let Some(split) = wkt.split_once("VERTCRS") {
+        (split.0, Some(split.1))
+    } else if let Some(split) = wkt.split_once("VERTICALCRS") {
+        (split.0, Some(split.1))
+    } else if let Some(split) = wkt.split_once("VERT_CS") {
+        (split.0, Some(split.1))
+    } else {
+        (wkt.as_ref(), None)
+    };
+
+    let horizontal = trailing_code(horizontal_part.as_bytes())?;
+    if !EPSG_RANGE.contains(&horizontal) {
+        return None;
+    }
+    let vertical = vertical_part
+        .and_then(|s| trailing_code(s.as_bytes()))
+        .filter(|v| EPSG_RANGE.contains(v));
+    Some((horizontal, vertical))
 }
 
 /// Builds a COPC octree from scanned input files.
@@ -923,20 +983,34 @@ impl OctreeBuilder {
                 debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
-                let hdr = reader.header();
-                let b = hdr.bounds();
+                let header = reader.header();
+                let b = header.bounds();
                 let mut bounds = Bounds::empty();
                 bounds.expand_with(b.min.x, b.min.y, b.min.z);
                 bounds.expand_with(b.max.x, b.max.y, b.max.z);
-                let t = hdr.transforms();
+                let t = header.transforms();
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 config.report(crate::ProgressEvent::StageProgress { done: n });
-                let wkt_bytes: Option<Vec<u8>> = hdr
-                    .all_vlrs()
-                    .find(|v| v.is_wkt_crs())
-                    .map(|v| v.data.clone());
-                let wkt_crs_hash = wkt_bytes.as_deref().map(bytes_hash);
-                let extra_bytes_vlr: Option<Vec<u8>> = hdr
+                // CRS: support both WKT (LAS 1.4) and GeoTIFF (LAS 1.4 and earlier).
+                let (crs, wkt_bytes): (Option<CrsKind>, Option<Vec<u8>>) =
+                    if let Some(wkt) = header.get_wkt_crs_bytes() {
+                        let bytes = wkt.to_vec();
+                        let kind = CrsKind::WktHash(bytes_hash(&bytes));
+                        (Some(kind), Some(bytes))
+                    } else if let Ok(Some(geotiff)) = header.get_geotiff_crs() {
+                        let horizontal = match geotiff.get_gt_model_type_geo_key_value() {
+                            Some(1) => geotiff.get_projected_crs_geo_key_value(),
+                            Some(2) | Some(3) => geotiff.get_geodetic_crs_geo_key_value(),
+                            _ => None,
+                        };
+                        let vertical = geotiff.get_vertical_crs_geo_key_value();
+                        let kind = horizontal.map(|h| CrsKind::GeoTiffEpsg(h, vertical));
+                        (kind, None)
+                    } else {
+                        (None, None)
+                    };
+                // Extra Bytes: parse once per file.
+                let extra_bytes_vlr: Option<Vec<u8>> = header
                     .all_vlrs()
                     .find(|v| v.user_id.trim_end_matches('\0') == "LASF_Spec" && v.record_id == 4)
                     .map(|v| v.data.clone());
@@ -950,22 +1024,22 @@ impl OctreeBuilder {
                 let extra_bytes_schema_hash = extra_bytes_parsed
                     .as_ref()
                     .map(crate::extra_bytes::schema_hash);
-                let num_extra_bytes = hdr.point_format().extra_bytes;
+                let num_extra_bytes = header.point_format().extra_bytes;
                 Ok((
                     ScanResult {
                         bounds,
-                        point_count: hdr.number_of_points(),
+                        point_count: header.number_of_points(),
                         scale_x: t.x.scale,
                         scale_y: t.y.scale,
                         scale_z: t.z.scale,
                         offset_x: t.x.offset,
                         offset_y: t.y.offset,
                         offset_z: t.z.offset,
-                        wkt_crs_hash,
+                        crs,
                         extra_bytes_parsed,
                         extra_bytes_schema_hash,
                         num_extra_bytes,
-                        point_format_id: hdr.point_format().to_u8().unwrap_or(0),
+                        point_format_id: header.point_format().to_u8().unwrap_or(0),
                     },
                     wkt_bytes,
                     extra_bytes_vlr,
