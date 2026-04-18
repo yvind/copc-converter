@@ -667,12 +667,15 @@ struct HierarchyPage {
 
 /// Recursively build hierarchy pages for a set of entries.
 ///
-/// Entries whose level is ≤ the current boundary live directly in the
-/// returned page. Entries below the boundary are grouped by their
-/// ancestor at the boundary level and recursed into child pages; a
-/// `HierarchyEntry` with `point_count = -1` is emitted in the parent
-/// page for each child, carrying placeholder offsets that
-/// [`build_hierarchy_payload`] patches once all pages are laid out.
+/// Entries with level **strictly less than** the current boundary stay in
+/// this page as regular entries. Entries at the boundary level and below
+/// are grouped by their ancestor at the boundary level — each group
+/// becomes a child page. For each group, the parent page emits a single
+/// `HierarchyEntry` with `point_count = -1` whose key matches the subtree
+/// root; per COPC spec this tells readers "the entry for this node lives
+/// in another hierarchy page" and they follow the pointer. The subtree
+/// root's real entry, along with all its descendants, lives inside the
+/// child page.
 fn build_hierarchy_page_recursive(
     entries: &[&HierarchyInputEntry],
     boundaries: &[i32],
@@ -700,13 +703,15 @@ fn build_hierarchy_page_recursive(
 
     let boundary_level = boundaries[boundary_idx];
 
-    // Split by boundary.
+    // Split: entries strictly above the boundary stay in this page; the
+    // boundary level and everything below it goes into child pages, grouped
+    // by their ancestor at the boundary level.
     let mut this_page_entries: Vec<&HierarchyInputEntry> = Vec::new();
     let mut child_groups: std::collections::BTreeMap<VoxelKey, Vec<&HierarchyInputEntry>> =
         std::collections::BTreeMap::new();
     for &entry in entries {
         let (key, _, _, _) = entry;
-        if key.level <= boundary_level {
+        if key.level < boundary_level {
             this_page_entries.push(entry);
         } else {
             let subtree_root = ancestor_at_level(*key, boundary_level);
@@ -1425,5 +1430,115 @@ mod tests {
         assert!(payload.is_empty());
         assert_eq!(root_off, 5_000);
         assert_eq!(root_size, 0);
+    }
+
+    /// Verify the spec-correct split: a boundary-level node is NOT a
+    /// regular entry in the parent page — it must only appear there as a
+    /// page pointer, with its real entry living inside the child page.
+    #[test]
+    fn hierarchy_paging_boundary_node_lives_in_child_page() {
+        // First boundary is level 3 (see choose_page_boundaries).
+        // Construct entries whose max level crosses the boundary.
+        let boundary = 3i32;
+        let boundary_key = VoxelKey {
+            level: boundary,
+            x: 1,
+            y: 2,
+            z: 3,
+        };
+        let descendant = VoxelKey {
+            level: boundary + 1,
+            x: 2,
+            y: 5,
+            z: 6, // child under (1,2,3) at level 3
+        };
+        let entries: Vec<HierarchyInputEntry> = vec![
+            (
+                VoxelKey {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                },
+                100,
+                42,
+                10,
+            ),
+            (
+                VoxelKey {
+                    level: 1,
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                },
+                200,
+                42,
+                10,
+            ),
+            (
+                VoxelKey {
+                    level: 2,
+                    x: 0,
+                    y: 1,
+                    z: 1,
+                },
+                300,
+                42,
+                10,
+            ),
+            (boundary_key, 400, 42, 10),
+            (descendant, 500, 42, 10),
+        ];
+
+        let evlr_data_start = 7_000u64;
+        let (payload, root_off, root_size) =
+            build_hierarchy_payload(&entries, evlr_data_start).unwrap();
+
+        // Parse the root page directly to see what's in it.
+        let root_start = (root_off - evlr_data_start) as usize;
+        let root_end = root_start + root_size as usize;
+        let root_bytes = &payload[root_start..root_end];
+
+        // Collect both regular entries and page pointers from the root.
+        let mut root_regular: Vec<(VoxelKey, i32)> = Vec::new();
+        let mut root_pointers: Vec<VoxelKey> = Vec::new();
+        for chunk in root_bytes.chunks_exact(32) {
+            let level = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let x = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            let y = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let z = i32::from_le_bytes(chunk[12..16].try_into().unwrap());
+            let point_count = i32::from_le_bytes(chunk[28..32].try_into().unwrap());
+            let key = VoxelKey { level, x, y, z };
+            if point_count == -1 {
+                root_pointers.push(key);
+            } else {
+                root_regular.push((key, point_count));
+            }
+        }
+
+        // Root page must contain only levels 0..boundary as regular entries.
+        for (key, _) in &root_regular {
+            assert!(
+                key.level < boundary,
+                "root page contained a regular entry at boundary level: {key:?}"
+            );
+        }
+
+        // The boundary node must appear as a page pointer, not a regular entry.
+        assert!(
+            root_pointers.contains(&boundary_key),
+            "expected a page pointer for boundary node {boundary_key:?} in root page, got pointers {root_pointers:?}"
+        );
+        assert!(
+            !root_regular.iter().any(|(k, _)| *k == boundary_key),
+            "boundary node {boundary_key:?} must not appear as a regular entry in the root page"
+        );
+
+        // And the full traversal still recovers every entry.
+        let mut decoded = collect_hierarchy(&payload, evlr_data_start, root_off, root_size);
+        decoded.sort_by_key(|(k, _, _, _)| (k.level, k.x, k.y, k.z));
+        let mut expected = entries.clone();
+        expected.sort_by_key(|(k, _, _, _)| (k.level, k.x, k.y, k.z));
+        assert_eq!(decoded, expected);
     }
 }
