@@ -571,19 +571,18 @@ pub fn write_copc(
     }
 
     // -----------------------------------------------------------------------
-    // EVLR: copc hierarchy
+    // EVLR: copc hierarchy (paged)
+    //
+    // Entries are split into a tree of pages so readers don't need to fetch
+    // the whole hierarchy before rendering the root node. The root page's
+    // offset and size are reported through the `CopcInfo` VLR so readers
+    // know where to start; page pointers inside pages are real
+    // `HierarchyEntry` records with `point_count = -1` (spec sentinel).
     // -----------------------------------------------------------------------
 
-    let mut hier_payload: Vec<u8> = Vec::with_capacity(chunk_info.len() * 32);
-    for (key, offset, byte_size, point_count) in &chunk_info {
-        HierarchyEntry {
-            key: *key,
-            offset: *offset,
-            byte_size: *byte_size,
-            point_count: *point_count,
-        }
-        .write(&mut hier_payload)?;
-    }
+    let hier_evlr_data_start = evlr_start + EVLR_HEADER_SIZE as u64;
+    let (hier_payload, hier_root_page_offset, hier_root_page_size) =
+        build_hierarchy_payload(&chunk_info, hier_evlr_data_start)?;
 
     file.seek(SeekFrom::Start(evlr_start))?;
     let mut w = BufWriter::new(file);
@@ -624,8 +623,8 @@ pub fn write_copc(
         center_z: builder.cz,
         halfsize: builder.halfsize,
         spacing: builder.halfsize / (1u64 << actual_max_depth) as f64,
-        root_hier_offset: evlr_start + EVLR_HEADER_SIZE as u64,
-        root_hier_size: hier_payload.len() as u64,
+        root_hier_offset: hier_root_page_offset,
+        root_hier_size: hier_root_page_size,
         gpstime_minimum: gpstime_min,
         gpstime_maximum: gpstime_max,
     };
@@ -646,6 +645,198 @@ pub fn write_copc(
 
     info!("COPC file written: {:?}", output_path);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// COPC hierarchy EVLR paged layout
+// ---------------------------------------------------------------------------
+
+/// One entry in the input to the hierarchy payload builder.
+/// `(key, chunk_offset, byte_size, point_count)` — empty ancestors use
+/// `(key, 0, 0, 0)` per COPC spec.
+type HierarchyInputEntry = (VoxelKey, u64, i32, i32);
+
+/// A single page in the COPC hierarchy EVLR, produced before absolute
+/// child-page offsets are known. `pointer_patches` lists the byte
+/// positions inside `data` where child page offset/size fields live,
+/// paired with the index of the child `HierarchyPage` in the flat list.
+struct HierarchyPage {
+    data: Vec<u8>,
+    pointer_patches: Vec<(usize, usize)>,
+}
+
+/// Recursively build hierarchy pages for a set of entries.
+///
+/// Entries whose level is ≤ the current boundary live directly in the
+/// returned page. Entries below the boundary are grouped by their
+/// ancestor at the boundary level and recursed into child pages; a
+/// `HierarchyEntry` with `point_count = -1` is emitted in the parent
+/// page for each child, carrying placeholder offsets that
+/// [`build_hierarchy_payload`] patches once all pages are laid out.
+fn build_hierarchy_page_recursive(
+    entries: &[&HierarchyInputEntry],
+    boundaries: &[i32],
+    boundary_idx: usize,
+    pages: &mut Vec<HierarchyPage>,
+) -> anyhow::Result<usize> {
+    if boundary_idx >= boundaries.len() || entries.is_empty() {
+        let mut data = Vec::with_capacity(entries.len() * 32);
+        for (key, offset, byte_size, point_count) in entries {
+            HierarchyEntry {
+                key: *key,
+                offset: *offset,
+                byte_size: *byte_size,
+                point_count: *point_count,
+            }
+            .write(&mut data)?;
+        }
+        let page_idx = pages.len();
+        pages.push(HierarchyPage {
+            data,
+            pointer_patches: Vec::new(),
+        });
+        return Ok(page_idx);
+    }
+
+    let boundary_level = boundaries[boundary_idx];
+
+    // Split by boundary.
+    let mut this_page_entries: Vec<&HierarchyInputEntry> = Vec::new();
+    let mut child_groups: std::collections::BTreeMap<VoxelKey, Vec<&HierarchyInputEntry>> =
+        std::collections::BTreeMap::new();
+    for &entry in entries {
+        let (key, _, _, _) = entry;
+        if key.level <= boundary_level {
+            this_page_entries.push(entry);
+        } else {
+            let subtree_root = ancestor_at_level(*key, boundary_level);
+            child_groups.entry(subtree_root).or_default().push(entry);
+        }
+    }
+
+    // Reserve a slot for this page so children can know the flat-list index
+    // to aim at with pointer patches.
+    let this_page_idx = pages.len();
+    pages.push(HierarchyPage {
+        data: Vec::new(),
+        pointer_patches: Vec::new(),
+    });
+
+    // Recurse into each child subtree first so we know all child page indices
+    // before serialising this page's pointers.
+    struct ChildInfo {
+        subtree_root: VoxelKey,
+        child_page_idx: usize,
+    }
+    let mut children: Vec<ChildInfo> = Vec::with_capacity(child_groups.len());
+    for (subtree_root, child_entries) in &child_groups {
+        let child_refs: Vec<&HierarchyInputEntry> = child_entries.to_vec();
+        let child_page_idx =
+            build_hierarchy_page_recursive(&child_refs, boundaries, boundary_idx + 1, pages)?;
+        children.push(ChildInfo {
+            subtree_root: *subtree_root,
+            child_page_idx,
+        });
+    }
+
+    // Serialise this page: regular entries first, then page pointers.
+    let mut data = Vec::with_capacity((this_page_entries.len() + children.len()) * 32);
+    for (key, offset, byte_size, point_count) in &this_page_entries {
+        HierarchyEntry {
+            key: *key,
+            offset: *offset,
+            byte_size: *byte_size,
+            point_count: *point_count,
+        }
+        .write(&mut data)?;
+    }
+
+    // A hierarchy page pointer is a HierarchyEntry with point_count = -1.
+    // `offset` carries the child page's absolute file offset (patched later)
+    // and `byte_size` carries the child page's size. The two fields live at
+    // bytes [16..24] (offset, u64) and [24..28] (byte_size, i32) inside each
+    // 32-byte HierarchyEntry.
+    let mut pointer_patches = Vec::with_capacity(children.len());
+    for child in &children {
+        let patch_offset = data.len() + 16;
+        HierarchyEntry {
+            key: child.subtree_root,
+            offset: 0,    // placeholder — patched later
+            byte_size: 0, // placeholder — patched later
+            point_count: -1,
+        }
+        .write(&mut data)?;
+        pointer_patches.push((patch_offset, child.child_page_idx));
+    }
+
+    pages[this_page_idx] = HierarchyPage {
+        data,
+        pointer_patches,
+    };
+    Ok(this_page_idx)
+}
+
+/// Build the COPC hierarchy EVLR payload with nested pages.
+///
+/// Returns `(payload_bytes, root_page_offset, root_page_size)`. The root
+/// page may live anywhere inside the payload; the CopcInfo VLR carries
+/// its absolute offset and size so readers can find it without scanning.
+fn build_hierarchy_payload(
+    entries: &[HierarchyInputEntry],
+    evlr_data_start: u64,
+) -> anyhow::Result<(Vec<u8>, u64, u64)> {
+    if entries.is_empty() {
+        return Ok((Vec::new(), evlr_data_start, 0));
+    }
+
+    let max_level = entries
+        .iter()
+        .map(|(k, _, _, _)| k.level)
+        .max()
+        .unwrap_or(0);
+    let boundaries = choose_page_boundaries(max_level);
+
+    let entry_refs: Vec<&HierarchyInputEntry> = entries.iter().collect();
+    let mut pages: Vec<HierarchyPage> = Vec::new();
+    let root_page_idx = build_hierarchy_page_recursive(&entry_refs, &boundaries, 0, &mut pages)?;
+
+    // Lay pages out sequentially from the EVLR data start.
+    let mut page_offsets: Vec<u64> = Vec::with_capacity(pages.len());
+    let mut offset = evlr_data_start;
+    for page in &pages {
+        page_offsets.push(offset);
+        offset += page.data.len() as u64;
+    }
+
+    // Patch child page offset/size fields in each page.
+    for i in 0..pages.len() {
+        let patches: Vec<(usize, u64, u32)> = pages[i]
+            .pointer_patches
+            .iter()
+            .map(|&(patch_offset, child_idx)| {
+                (
+                    patch_offset,
+                    page_offsets[child_idx],
+                    pages[child_idx].data.len() as u32,
+                )
+            })
+            .collect();
+        for (patch_offset, abs_offset, size) in patches {
+            pages[i].data[patch_offset..patch_offset + 8]
+                .copy_from_slice(&abs_offset.to_le_bytes());
+            pages[i].data[patch_offset + 8..patch_offset + 12].copy_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    let root_page_offset = page_offsets[root_page_idx];
+    let root_page_size = pages[root_page_idx].data.len() as u64;
+
+    let total: usize = pages.iter().map(|p| p.data.len()).sum();
+    let mut payload = Vec::with_capacity(total);
+    for page in &pages {
+        payload.extend_from_slice(&page.data);
+    }
+    Ok((payload, root_page_offset, root_page_size))
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,5 +1269,161 @@ mod tests {
             buf7[..30],
             "format 6 must match the first 30 bytes of format 7"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hierarchy paging
+    // -----------------------------------------------------------------------
+
+    /// Decode an in-memory hierarchy payload by following page pointers from
+    /// the root. Returns every data entry reachable through the page tree,
+    /// independent of serialisation order.
+    fn collect_hierarchy(
+        payload: &[u8],
+        evlr_data_start: u64,
+        root_offset: u64,
+        root_size: u64,
+    ) -> Vec<HierarchyInputEntry> {
+        fn read_page(
+            payload: &[u8],
+            evlr_data_start: u64,
+            offset: u64,
+            size: u64,
+            out: &mut Vec<HierarchyInputEntry>,
+        ) {
+            let start = (offset - evlr_data_start) as usize;
+            let end = start + size as usize;
+            let page = &payload[start..end];
+            assert!(
+                size.is_multiple_of(32),
+                "hierarchy page size must be a multiple of 32"
+            );
+            for entry_bytes in page.chunks_exact(32) {
+                let level = i32::from_le_bytes(entry_bytes[0..4].try_into().unwrap());
+                let x = i32::from_le_bytes(entry_bytes[4..8].try_into().unwrap());
+                let y = i32::from_le_bytes(entry_bytes[8..12].try_into().unwrap());
+                let z = i32::from_le_bytes(entry_bytes[12..16].try_into().unwrap());
+                let entry_offset = u64::from_le_bytes(entry_bytes[16..24].try_into().unwrap());
+                let entry_byte_size = i32::from_le_bytes(entry_bytes[24..28].try_into().unwrap());
+                let entry_point_count = i32::from_le_bytes(entry_bytes[28..32].try_into().unwrap());
+                let key = VoxelKey { level, x, y, z };
+                if entry_point_count == -1 {
+                    read_page(
+                        payload,
+                        evlr_data_start,
+                        entry_offset,
+                        entry_byte_size as u64,
+                        out,
+                    );
+                } else {
+                    out.push((key, entry_offset, entry_byte_size, entry_point_count));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        read_page(payload, evlr_data_start, root_offset, root_size, &mut out);
+        out
+    }
+
+    #[test]
+    fn hierarchy_paging_small_tree_stays_flat() {
+        // All entries within the shallow boundary → single page, no pointers.
+        let entries: Vec<HierarchyInputEntry> = vec![
+            (
+                VoxelKey {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                },
+                100,
+                42,
+                10,
+            ),
+            (
+                VoxelKey {
+                    level: 1,
+                    x: 1,
+                    y: 0,
+                    z: 0,
+                },
+                200,
+                84,
+                20,
+            ),
+            (
+                VoxelKey {
+                    level: 2,
+                    x: 3,
+                    y: 1,
+                    z: 1,
+                },
+                300,
+                168,
+                40,
+            ),
+        ];
+        let (payload, root_off, root_size) = build_hierarchy_payload(&entries, 1_000).unwrap();
+
+        // Every 32-byte record in the payload must be a regular entry;
+        // none should be page pointers.
+        assert_eq!(payload.len() as u64, root_size);
+        assert_eq!(root_off, 1_000);
+
+        let decoded = collect_hierarchy(&payload, 1_000, root_off, root_size);
+        assert_eq!(decoded.len(), 3);
+        // Order within a flat page matches insertion order.
+        assert_eq!(decoded[0].0.level, 0);
+        assert_eq!(decoded[2].0.level, 2);
+    }
+
+    #[test]
+    fn hierarchy_paging_deep_tree_produces_multiple_pages() {
+        // Build enough entries across levels 0–8 to trigger at least one
+        // page split (boundaries kick in at levels 3, 6, ...).
+        let mut entries: Vec<HierarchyInputEntry> = Vec::new();
+        for level in 0..=8 {
+            let span = 1 << level;
+            for x in 0..span.min(3) {
+                for y in 0..span.min(3) {
+                    for z in 0..span.min(3) {
+                        let key = VoxelKey { level, x, y, z };
+                        entries.push((key, 100 + entries.len() as u64, 42, 10));
+                    }
+                }
+            }
+        }
+        let n_entries = entries.len();
+
+        let (payload, root_off, root_size) = build_hierarchy_payload(&entries, 10_000).unwrap();
+
+        // Payload should contain more than just the root page when entries
+        // span past the first boundary.
+        assert!(
+            payload.len() as u64 > root_size,
+            "deep tree must produce a payload larger than the root page alone"
+        );
+
+        // Following page pointers from the root must recover exactly the
+        // input set (ignoring order).
+        let mut decoded = collect_hierarchy(&payload, 10_000, root_off, root_size);
+        decoded.sort_by_key(|(k, _, _, _)| (k.level, k.x, k.y, k.z));
+        let mut expected = entries.clone();
+        expected.sort_by_key(|(k, _, _, _)| (k.level, k.x, k.y, k.z));
+        assert_eq!(decoded.len(), n_entries);
+        for (a, b) in decoded.iter().zip(expected.iter()) {
+            assert_eq!(a.0, b.0, "key mismatch");
+            assert_eq!(a.1, b.1, "offset mismatch for {:?}", a.0);
+            assert_eq!(a.2, b.2, "byte_size mismatch for {:?}", a.0);
+            assert_eq!(a.3, b.3, "point_count mismatch for {:?}", a.0);
+        }
+    }
+
+    #[test]
+    fn hierarchy_paging_empty_input_returns_empty_payload() {
+        let (payload, root_off, root_size) = build_hierarchy_payload(&[], 5_000).unwrap();
+        assert!(payload.is_empty());
+        assert_eq!(root_off, 5_000);
+        assert_eq!(root_size, 0);
     }
 }

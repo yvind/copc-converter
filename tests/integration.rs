@@ -169,15 +169,27 @@ fn read_copc_info(data: &[u8]) -> CopcInfo {
     }
 }
 
+/// Parse every hierarchy entry reachable from the root page, following
+/// page pointers (entries with `point_count = -1`). Returns only data
+/// entries (page pointers are expanded in place).
 fn read_hierarchy(data: &[u8]) -> Vec<HierarchyEntry> {
     let info = read_copc_info(data);
-    let offset = info.root_hier_offset as usize;
-    let size = info.root_hier_size as usize;
-    let payload = &data[offset..offset + size];
-    let mut r = Cursor::new(payload);
     let mut entries = Vec::new();
+    read_hierarchy_page(
+        data,
+        info.root_hier_offset,
+        info.root_hier_size,
+        &mut entries,
+    );
+    entries
+}
 
-    while r.position() < size as u64 {
+fn read_hierarchy_page(data: &[u8], offset: u64, size: u64, out: &mut Vec<HierarchyEntry>) {
+    let start = offset as usize;
+    let end = start + size as usize;
+    let payload = &data[start..end];
+    let mut r = Cursor::new(payload);
+    while r.position() < size {
         let key = VoxelKey {
             level: r.read_i32::<LittleEndian>().unwrap(),
             x: r.read_i32::<LittleEndian>().unwrap(),
@@ -187,14 +199,18 @@ fn read_hierarchy(data: &[u8]) -> Vec<HierarchyEntry> {
         let entry_offset = r.read_u64::<LittleEndian>().unwrap();
         let byte_size = r.read_i32::<LittleEndian>().unwrap();
         let point_count = r.read_i32::<LittleEndian>().unwrap();
-        entries.push(HierarchyEntry {
-            key,
-            offset: entry_offset,
-            byte_size,
-            point_count,
-        });
+        if point_count == -1 {
+            // Page pointer: recurse into the child page.
+            read_hierarchy_page(data, entry_offset, byte_size as u64, out);
+        } else {
+            out.push(HierarchyEntry {
+                key,
+                offset: entry_offset,
+                byte_size,
+                point_count,
+            });
+        }
     }
-    entries
 }
 
 #[derive(Debug)]
