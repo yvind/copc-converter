@@ -5,6 +5,14 @@ on:
       - master
   pull_request:
 
+# `.cargo/config.toml` sets `-C target-cpu=native` for local release
+# builds. That flag occasionally trips a clippy SIGILL on GitHub
+# runners and produces output we'd never ship anyway (CI only runs
+# the compiled artefacts inside the workflow). `RUSTFLAGS=""` replaces
+# the config.toml rustflags outright.
+env:
+  RUSTFLAGS: ""
+
 jobs:
   rustfmt:
     name: Check Style
