@@ -444,6 +444,43 @@ fn copc_info_matches_reference() {
 }
 
 #[test]
+fn spacing_matches_copc_spec() {
+    // COPC 1.0 spec: spacing is the inter-point distance at the root
+    // node, halving with each level. Untwine writes this as
+    // 2 * halfsize / CellCount with CellCount = 128. Verify our writer
+    // matches both the spec formula and the untwine reference value.
+    let output = Path::new("tests/data/test_copc_spacing.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+
+    let ours = read_file(output);
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+
+    let info_ours = read_copc_info(&ours);
+    let info_ref = read_copc_info(&reference);
+
+    let expected_ours = 2.0 * info_ours.halfsize / 128.0;
+    assert!(
+        (info_ours.spacing - expected_ours).abs() < 1e-9,
+        "spacing should be 2*halfsize/128: got {}, expected {} (halfsize={})",
+        info_ours.spacing,
+        expected_ours,
+        info_ours.halfsize
+    );
+
+    let expected_ref = 2.0 * info_ref.halfsize / 128.0;
+    assert!(
+        (info_ref.spacing - expected_ref).abs() < 1e-9,
+        "untwine reference spacing should be 2*halfsize/128: got {}, expected {} \
+         (halfsize={}) — sanity check on the reference fixture",
+        info_ref.spacing,
+        expected_ref,
+        info_ref.halfsize
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
 fn hierarchy_preserves_all_points() {
     let output = Path::new("tests/data/test_hierarchy.copc.laz");
     run_converter(Path::new("tests/data/input.laz"), output);

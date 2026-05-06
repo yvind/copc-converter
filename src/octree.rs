@@ -300,7 +300,7 @@ const MAX_LEAF_POINTS: u64 = 100_000;
 
 /// Grid cells per axis for LOD thinning. Matches untwine's CellCount = 128.
 /// Higher values keep more points at coarse LOD levels (better progressive rendering).
-const GRID_CELLS_PER_AXIS: i64 = 128;
+pub(crate) const GRID_CELLS_PER_AXIS: i64 = 128;
 
 // ---------------------------------------------------------------------------
 // Raw point storage

@@ -22,7 +22,7 @@ use crate::copc_types::{
     CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TEMPORAL_HEADER_SIZE, TemporalIndexEntry,
     TemporalIndexHeader, TemporalPagePointer, VoxelKey, write_evlr, write_vlr,
 };
-use crate::octree::{OctreeBuilder, RawPoint};
+use crate::octree::{GRID_CELLS_PER_AXIS, OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use laz::{LazVlrBuilder, ParLasZipCompressor};
@@ -94,11 +94,6 @@ pub fn write_copc(
 
     let point_format = builder.point_format;
     let point_record_len = point_record_length(point_format);
-    let actual_max_depth = node_keys
-        .iter()
-        .map(|(k, _)| k.level as u32)
-        .max()
-        .unwrap_or(0);
 
     // -----------------------------------------------------------------------
     // Build the LAZ VLR (variable-size chunks)
@@ -247,7 +242,7 @@ pub fn write_copc(
         center_y: builder.cy,
         center_z: builder.cz,
         halfsize: builder.halfsize,
-        spacing: builder.halfsize / (1u64 << actual_max_depth) as f64,
+        spacing: 2.0 * builder.halfsize / GRID_CELLS_PER_AXIS as f64,
         root_hier_offset: 0,
         root_hier_size: 0,
         gpstime_minimum: 0.0,
@@ -622,7 +617,7 @@ pub fn write_copc(
         center_y: builder.cy,
         center_z: builder.cz,
         halfsize: builder.halfsize,
-        spacing: builder.halfsize / (1u64 << actual_max_depth) as f64,
+        spacing: 2.0 * builder.halfsize / GRID_CELLS_PER_AXIS as f64,
         root_hier_offset: hier_root_page_offset,
         root_hier_size: hier_root_page_size,
         gpstime_minimum: gpstime_min,
