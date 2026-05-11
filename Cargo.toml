@@ -9,6 +9,10 @@ keywords = ["copc", "las", "laz", "pointcloud", "lidar"]
 categories = ["command-line-utilities", "science::geo"]
 repository = "https://github.com/360-geo/copc-converter"
 default-run = "copc_converter"
+# Test fixtures total ~12 MB, over crates.io's 10 MiB tarball limit and
+# unnecessary for downstream lib consumers. CI and local development
+# work from the git repo where these files are present.
+exclude = ["tests/data/*"]
 
 [lib]
 name = "copc_converter"
