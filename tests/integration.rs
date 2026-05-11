@@ -1260,3 +1260,171 @@ fn temp_compression_lz4_multi_chunk_preserves_all_points() {
 
     let _ = std::fs::remove_file(output);
 }
+
+// ---------------------------------------------------------------------------
+// LAS Extra Bytes pass-through
+// ---------------------------------------------------------------------------
+//
+// `tests/data/extra_bytes_input.laz` is a LAS 1.4 point-format-3 file with a
+// LASF_Spec/4 Extra Bytes VLR declaring four trailing fields (treeId,
+// semantic, bisemantic, zNorm), totalling 12 bytes per point. The
+// converter must:
+//   1. Preserve the VLR byte-for-byte in the output.
+//   2. Advertise a point record length that includes the 12 extra bytes.
+//   3. Carry the per-point extra bytes through to the LAZ-compressed
+//      payload so readers can decode the same field values.
+
+const EXTRA_BYTES_VLR_SIZE: usize = 4 * 192; // 4 entries × 192 bytes
+
+#[test]
+fn extra_bytes_vlr_preserved() {
+    let input = Path::new("tests/data/extra_bytes_input.laz");
+    let output = Path::new("tests/data/test_extras_vlr.copc.laz");
+    run_converter(input, output);
+
+    let input_bytes = read_file(input);
+    let output_bytes = read_file(output);
+
+    let in_vlr = find_vlr(&input_bytes, "LASF_Spec", 4).expect("input must have Extra Bytes VLR");
+    let out_vlr =
+        find_vlr(&output_bytes, "LASF_Spec", 4).expect("output must preserve Extra Bytes VLR");
+    assert_eq!(
+        in_vlr.len(),
+        EXTRA_BYTES_VLR_SIZE,
+        "input VLR should be 4 × 192 bytes"
+    );
+    assert_eq!(
+        out_vlr, in_vlr,
+        "output Extra Bytes VLR must be byte-identical to input"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn extra_bytes_header_record_length() {
+    let output = Path::new("tests/data/test_extras_record_len.copc.laz");
+    run_converter(Path::new("tests/data/extra_bytes_input.laz"), output);
+
+    let bytes = read_file(output);
+    let header = read_las_header(&bytes);
+    // Input is point format 3 → COPC promotes it to format 7. Format-7 base
+    // is 36 bytes; the 12 trailing extras land on top of that.
+    assert_eq!(
+        header.point_format, 7,
+        "format-3 input should be promoted to format 7"
+    );
+    assert_eq!(
+        header.point_record_len, 48,
+        "header record length must include extras (36 base + 12 extras)"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn extra_bytes_per_point_payload_round_trips() {
+    let input = Path::new("tests/data/extra_bytes_input.laz");
+    let output = Path::new("tests/data/test_extras_per_point.copc.laz");
+    run_converter(input, output);
+
+    // Read input extras stats: compute per-field min/max across all input
+    // points, then assert the output covers the same value range (the
+    // converter does not drop points; thinning only redistributes them
+    // across LOD nodes — every input point still appears somewhere).
+    let mut in_reader = las::Reader::from_path(input).expect("open input");
+    let mut in_pts: Vec<las::Point> = Vec::new();
+    in_reader
+        .read_points_into(u64::MAX, &mut in_pts)
+        .expect("read input points");
+    assert!(!in_pts.is_empty(), "input must have points");
+    assert!(
+        in_pts.iter().all(|p| p.extra_bytes.len() == 12),
+        "every input point should carry 12 extras"
+    );
+
+    // Per-byte max across all input points. We don't depend on which
+    // logical field maps to which byte offset (the Extra Bytes VLR
+    // declares that). We only need to know which bytes carry non-zero
+    // values so the assertions catch a regression where the converter
+    // writes zeros instead of pass-through bytes.
+    let n_extras = in_pts[0].extra_bytes.len();
+    let in_byte_max: Vec<u8> = (0..n_extras)
+        .map(|i| in_pts.iter().map(|p| p.extra_bytes[i]).max().unwrap_or(0))
+        .collect();
+    assert!(
+        in_byte_max.iter().any(|m| *m > 0),
+        "input extras must have at least one non-zero byte position \
+         (test would be vacuous otherwise)"
+    );
+
+    let mut out_reader = las::Reader::from_path(output).expect("open output");
+    let mut out_pts: Vec<las::Point> = Vec::new();
+    out_reader
+        .read_points_into(u64::MAX, &mut out_pts)
+        .expect("read output points");
+
+    assert!(!out_pts.is_empty(), "output must have points");
+    assert!(
+        out_pts.iter().all(|p| p.extra_bytes.len() == 12),
+        "every output point must carry 12 extras"
+    );
+
+    let out_byte_max: Vec<u8> = (0..n_extras)
+        .map(|i| out_pts.iter().map(|p| p.extra_bytes[i]).max().unwrap_or(0))
+        .collect();
+
+    // The converter does not drop points; LOD thinning only redistributes
+    // them across nodes. So every byte-position max must round-trip exactly.
+    assert_eq!(
+        in_byte_max, out_byte_max,
+        "per-byte max of extras must round-trip exactly"
+    );
+
+    // Every point's extras must match a corresponding input point exactly.
+    // We can't rely on order since LOD thinning reorders points, so we
+    // sample a few points by (x, y, z) coordinate. The chance of two
+    // distinct input points sharing all three scaled-int coordinates is
+    // vanishingly small for a real lidar dataset.
+    use std::collections::HashMap;
+    let in_lookup: HashMap<(i32, i32, i32), &[u8]> = in_pts
+        .iter()
+        .map(|p| {
+            // las::Point coordinates are already in scaled f64 — quantise
+            // back to ints for stable hashing.
+            let key = (
+                (p.x * 1000.0).round() as i32,
+                (p.y * 1000.0).round() as i32,
+                (p.z * 1000.0).round() as i32,
+            );
+            (key, p.extra_bytes.as_slice())
+        })
+        .collect();
+
+    let mut matched = 0usize;
+    let mut checked = 0usize;
+    for out_p in out_pts.iter().take(5000) {
+        let key = (
+            (out_p.x * 1000.0).round() as i32,
+            (out_p.y * 1000.0).round() as i32,
+            (out_p.z * 1000.0).round() as i32,
+        );
+        if let Some(in_extras) = in_lookup.get(&key) {
+            checked += 1;
+            if &out_p.extra_bytes[..] == *in_extras {
+                matched += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 100,
+        "should find at least 100 output points whose coordinates match an input point \
+         (got {checked}); coordinate quantisation may have changed"
+    );
+    assert_eq!(
+        matched, checked,
+        "every matched-coordinate point must have identical extras (matched={matched}/{checked})"
+    );
+
+    let _ = std::fs::remove_file(output);
+}

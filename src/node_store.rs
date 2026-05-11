@@ -40,12 +40,17 @@ pub(crate) trait NodeStore: Send + Sync {
 
 pub(crate) struct FileNodeStore {
     tmp_dir: PathBuf,
+    num_extra_bytes: u16,
     codec: TempCompression,
 }
 
 impl FileNodeStore {
-    pub(crate) fn new(tmp_dir: PathBuf, codec: TempCompression) -> Self {
-        Self { tmp_dir, codec }
+    pub(crate) fn new(tmp_dir: PathBuf, num_extra_bytes: u16, codec: TempCompression) -> Self {
+        Self {
+            tmp_dir,
+            num_extra_bytes,
+            codec,
+        }
     }
 
     fn node_path(&self, key: &VoxelKey) -> PathBuf {
@@ -59,7 +64,7 @@ impl NodeStore for FileNodeStore {
         let path = self.node_path(key);
         let f = File::create(&path)?;
         let mut w = BufWriter::new(f);
-        write_temp_batch(&mut w, points, self.codec)?;
+        write_temp_batch(&mut w, points, self.num_extra_bytes, self.codec)?;
         w.flush().context("flush node temp file")?;
         Ok(())
     }
@@ -71,11 +76,11 @@ impl NodeStore for FileNodeStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        read_temp_batches(f, self.codec)
+        read_temp_batches(f, self.num_extra_bytes, self.codec)
     }
 
     fn count(&self, key: &VoxelKey) -> Result<u64> {
-        count_temp_file_points(&self.node_path(key), self.codec)
+        count_temp_file_points(&self.node_path(key), self.num_extra_bytes, self.codec)
     }
 }
 
@@ -93,6 +98,7 @@ struct NodeLocation {
 
 pub(crate) struct PackedNodeStore {
     packs_dir: PathBuf,
+    num_extra_bytes: u16,
     codec: TempCompression,
     /// One writer per pack file, wrapped in a Mutex so rayon workers that
     /// map to the same pack id serialize their appends.
@@ -107,7 +113,12 @@ pub(crate) struct PackedNodeStore {
 }
 
 impl PackedNodeStore {
-    pub(crate) fn new(tmp_dir: &Path, codec: TempCompression, pack_count: usize) -> Result<Self> {
+    pub(crate) fn new(
+        tmp_dir: &Path,
+        num_extra_bytes: u16,
+        codec: TempCompression,
+        pack_count: usize,
+    ) -> Result<Self> {
         let packs_dir = tmp_dir.join("nodes");
         std::fs::create_dir_all(&packs_dir)
             .with_context(|| format!("creating packs dir {:?}", packs_dir))?;
@@ -128,6 +139,7 @@ impl PackedNodeStore {
 
         Ok(Self {
             packs_dir,
+            num_extra_bytes,
             codec,
             packs,
             pack_offsets,
@@ -151,7 +163,7 @@ impl NodeStore for PackedNodeStore {
         // Serialize first so we know the exact byte length and the pack
         // Mutex is held for the shortest possible time.
         let mut buf = Vec::new();
-        write_temp_batch(&mut buf, points, self.codec)?;
+        write_temp_batch(&mut buf, points, self.num_extra_bytes, self.codec)?;
         let byte_len = buf.len() as u32;
 
         let pack_id = self.current_pack_id();
@@ -203,7 +215,7 @@ impl NodeStore for PackedNodeStore {
         f.seek(SeekFrom::Start(loc.offset))
             .context("seek to node offset")?;
         let mut limited = f.take(loc.byte_len as u64);
-        read_temp_batches(&mut limited, self.codec)
+        read_temp_batches(&mut limited, self.num_extra_bytes, self.codec)
     }
 
     fn count(&self, key: &VoxelKey) -> Result<u64> {
@@ -237,6 +249,7 @@ mod tests {
             green: 0,
             blue: 0,
             nir: 0,
+            extras: Box::<[u8]>::default(),
         }
     }
 
@@ -244,7 +257,7 @@ mod tests {
     fn packed_write_read_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("copc_test_packed_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let store = PackedNodeStore::new(&tmp, TempCompression::None, 2).unwrap();
+        let store = PackedNodeStore::new(&tmp, 0, TempCompression::None, 2).unwrap();
 
         let key = VoxelKey {
             level: 3,
@@ -268,7 +281,7 @@ mod tests {
     fn packed_overwrite_returns_latest() {
         let tmp = std::env::temp_dir().join(format!("copc_test_packed_ow_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let store = PackedNodeStore::new(&tmp, TempCompression::None, 1).unwrap();
+        let store = PackedNodeStore::new(&tmp, 0, TempCompression::None, 1).unwrap();
 
         let key = VoxelKey {
             level: 2,
@@ -295,7 +308,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("copc_test_packed_miss_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let store = PackedNodeStore::new(&tmp, TempCompression::None, 1).unwrap();
+        let store = PackedNodeStore::new(&tmp, 0, TempCompression::None, 1).unwrap();
 
         let key = VoxelKey {
             level: 1,
@@ -316,7 +329,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let store = Arc::new(PackedNodeStore::new(&tmp, TempCompression::None, 4).unwrap());
+        let store = Arc::new(PackedNodeStore::new(&tmp, 0, TempCompression::None, 4).unwrap());
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)

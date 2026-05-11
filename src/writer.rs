@@ -34,13 +34,14 @@ use tracing::{debug, error, info};
 // ---------------------------------------------------------------------------
 // Point record sizes: format 6 = 30, format 7 = 36, format 8 = 38
 // ---------------------------------------------------------------------------
-fn point_record_length(fmt: u8) -> u16 {
-    match fmt {
+fn point_record_length(fmt: u8, num_extra_bytes: u16) -> u16 {
+    let base = match fmt {
         6 => 30,
         7 => 36,
         8 => 38,
         _ => 36,
-    }
+    };
+    base + num_extra_bytes
 }
 
 /// Encode the format-6 base fields (30 bytes) shared by all COPC formats.
@@ -60,7 +61,8 @@ fn encode_point_base(rp: &RawPoint, buf: &mut Vec<u8>) {
     // Total = 4+4+4+2+1+1+1+1+2+2+8 = 30 bytes
 }
 
-/// Encode one point according to the COPC output format (6, 7, or 8).
+/// Encode one point according to the COPC output format (6, 7, or 8),
+/// appending any per-point extra bytes after the format-specific fields.
 fn encode_point(rp: &RawPoint, fmt: u8, buf: &mut Vec<u8>) {
     encode_point_base(rp, buf);
     if fmt >= 7 {
@@ -71,6 +73,7 @@ fn encode_point(rp: &RawPoint, fmt: u8, buf: &mut Vec<u8>) {
     if fmt >= 8 {
         buf.extend_from_slice(&rp.nir.to_le_bytes());
     }
+    buf.extend_from_slice(&rp.extras);
 }
 
 /// Write a complete COPC file to `output_path`.
@@ -93,13 +96,14 @@ pub fn write_copc(
     let offset_z = builder.offset_z;
 
     let point_format = builder.point_format;
-    let point_record_len = point_record_length(point_format);
+    let num_extra_bytes = builder.num_extra_bytes;
+    let point_record_len = point_record_length(point_format, num_extra_bytes);
 
     // -----------------------------------------------------------------------
     // Build the LAZ VLR (variable-size chunks)
     // -----------------------------------------------------------------------
     let laz_vlr = LazVlrBuilder::default()
-        .with_point_format(point_format, 0)
+        .with_point_format(point_format, num_extra_bytes)
         .context("LazVlrBuilder for format")?
         .with_variable_chunk_size()
         .build();
@@ -111,11 +115,23 @@ pub fn write_copc(
     // File layout constants
     // -----------------------------------------------------------------------
     let wkt_crs = &builder.wkt_crs;
+    let extra_bytes_vlr = &builder.extra_bytes_vlr;
     let copc_info_vlr_size: u32 = 54 + 160; // 214
     let laz_vlr_size: u32 = 54 + laz_vlr_payload.len() as u32;
     let wkt_vlr_size: u32 = wkt_crs.as_ref().map(|d| 54 + d.len() as u32).unwrap_or(0);
-    let num_vlrs: u32 = if wkt_crs.is_some() { 3 } else { 2 };
-    let offset_to_point_data: u32 = 375 + copc_info_vlr_size + laz_vlr_size + wkt_vlr_size;
+    let extra_bytes_vlr_size: u32 = extra_bytes_vlr
+        .as_ref()
+        .map(|d| 54 + d.len() as u32)
+        .unwrap_or(0);
+    let mut num_vlrs: u32 = 2; // copc info + laszip
+    if wkt_crs.is_some() {
+        num_vlrs += 1;
+    }
+    if extra_bytes_vlr.is_some() {
+        num_vlrs += 1;
+    }
+    let offset_to_point_data: u32 =
+        375 + copc_info_vlr_size + laz_vlr_size + wkt_vlr_size + extra_bytes_vlr_size;
 
     let copc_info_payload_pos: u64 = 375 + 54;
 
@@ -270,13 +286,20 @@ pub fn write_copc(
         write_vlr(&mut w, "LASF_Projection", 2112, "WKT", wkt_data)?;
     }
 
+    // -----------------------------------------------------------------------
+    // VLR 4 (optional): LAS Extra Bytes schema, passed through unchanged.
+    // -----------------------------------------------------------------------
+    if let Some(eb_data) = extra_bytes_vlr {
+        write_vlr(&mut w, "LASF_Spec", 4, "Extra Bytes Record", eb_data)?;
+    }
+
     w.flush()?;
 
     // -----------------------------------------------------------------------
     // Parallel compression via ParLasZipCompressor
     // -----------------------------------------------------------------------
     let laz_vlr_for_compressor = LazVlrBuilder::default()
-        .with_point_format(point_format, 0)
+        .with_point_format(point_format, num_extra_bytes)
         .context("LazVlrBuilder (compressor)")?
         .with_variable_chunk_size()
         .build();
@@ -523,7 +546,7 @@ pub fn write_copc(
     // Read the chunk table back from the file to get per-chunk byte sizes
     // -----------------------------------------------------------------------
     let read_vlr = LazVlrBuilder::default()
-        .with_point_format(point_format, 0)
+        .with_point_format(point_format, num_extra_bytes)
         .context("LazVlrBuilder (read)")?
         .with_variable_chunk_size()
         .build();
@@ -1152,14 +1175,34 @@ mod tests {
             green: 0,
             blue: 65535,
             nir: 32768,
+            extras: Box::<[u8]>::default(),
         }
+    }
+
+    fn sample_point_with_extras(extras: &[u8]) -> RawPoint {
+        let mut p = sample_point();
+        p.extras = extras.to_vec().into_boxed_slice();
+        p
     }
 
     #[test]
     fn point_record_lengths() {
-        assert_eq!(point_record_length(6), 30);
-        assert_eq!(point_record_length(7), 36);
-        assert_eq!(point_record_length(8), 38);
+        assert_eq!(point_record_length(6, 0), 30);
+        assert_eq!(point_record_length(7, 0), 36);
+        assert_eq!(point_record_length(8, 0), 38);
+        assert_eq!(point_record_length(6, 12), 42);
+        assert_eq!(point_record_length(7, 12), 48);
+        assert_eq!(point_record_length(8, 12), 50);
+    }
+
+    #[test]
+    fn encode_point_appends_extras() {
+        let p = sample_point_with_extras(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut buf = Vec::new();
+        encode_point(&p, 7, &mut buf);
+        // format-7 base is 36 bytes; extras (4) should follow.
+        assert_eq!(buf.len(), 40);
+        assert_eq!(&buf[36..], &[0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
     #[test]

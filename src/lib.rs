@@ -67,6 +67,18 @@ pub enum Error {
         file_b: PathBuf,
     },
 
+    /// Input files have mismatched LAS Extra Bytes schemas. All inputs
+    /// must declare an identical Extra Bytes VLR and the same trailing
+    /// byte count per point — otherwise the merged COPC would advertise
+    /// a schema that doesn't apply uniformly to its point data.
+    #[error("Extra Bytes mismatch: {file_a:?} has a different Extra Bytes schema than {file_b:?}")]
+    ExtraBytesMismatch {
+        /// Path of the first file.
+        file_a: PathBuf,
+        /// Path of the differing file.
+        file_b: PathBuf,
+    },
+
     /// Input files have mismatched point formats.
     #[error(
         "Point format mismatch: {file_a:?} has format {format_a} but {file_b:?} has format {format_b}"
@@ -240,6 +252,9 @@ struct PipelineInner {
     /// Stored once here instead of once per `ScanResult` so memory stays
     /// O(1) in the number of input files.
     canonical_wkt: Option<Vec<u8>>,
+    /// Single canonical Extra Bytes VLR payload from the first scanned
+    /// file (if any). Same O(1)-memory rationale as `canonical_wkt`.
+    canonical_extra_bytes_vlr: Option<Vec<u8>>,
     validated: Option<validate::ValidatedInputs>,
     builder: Option<OctreeBuilder>,
     node_keys: Option<Vec<(VoxelKey, usize)>>,
@@ -260,6 +275,7 @@ impl Pipeline<Scanned> {
                 config,
                 scan_results: scan_output.results,
                 canonical_wkt: scan_output.canonical_wkt,
+                canonical_extra_bytes_vlr: scan_output.canonical_extra_bytes_vlr,
                 validated: None,
                 builder: None,
                 node_keys: None,
@@ -275,6 +291,7 @@ impl Pipeline<Scanned> {
             &self.inner.input_files,
             &self.inner.scan_results,
             self.inner.canonical_wkt.take(),
+            self.inner.canonical_extra_bytes_vlr.take(),
             self.inner.config.temporal_index,
         )?;
         self.inner.validated = Some(validated);

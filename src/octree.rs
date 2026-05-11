@@ -53,15 +53,17 @@ struct ChunkWriterCache {
     /// Insertion / access order. Front = least recently used.
     order: VecDeque<u32>,
     capacity: usize,
+    num_extra_bytes: u16,
     codec: TempCompression,
 }
 
 impl ChunkWriterCache {
-    fn new(capacity: usize, codec: TempCompression) -> Self {
+    fn new(capacity: usize, num_extra_bytes: u16, codec: TempCompression) -> Self {
         ChunkWriterCache {
             writers: HashMap::new(),
             order: VecDeque::new(),
             capacity,
+            num_extra_bytes,
             codec,
         }
     }
@@ -101,7 +103,7 @@ impl ChunkWriterCache {
         }
 
         let w = self.writers.get_mut(&chunk_idx).expect("just inserted");
-        write_temp_batch(w, points, self.codec)?;
+        write_temp_batch(w, points, self.num_extra_bytes, self.codec)?;
         Ok(())
     }
 
@@ -308,6 +310,10 @@ pub(crate) const GRID_CELLS_PER_AXIS: i64 = 128;
 
 /// A raw point stored as scaled integer coordinates plus attributes.
 /// Scaled ints allow exact LAS round-trip without floating-point loss.
+///
+/// `extras` carries the trailing per-point bytes from any LAS Extra Bytes
+/// VLR present in the input. When the input declares no extras the slice
+/// is empty and adds no heap pressure (empty `Box<[u8]>` is one word).
 #[derive(Debug, Clone)]
 pub struct RawPoint {
     pub x: i32,
@@ -325,41 +331,44 @@ pub struct RawPoint {
     pub green: u16,
     pub blue: u16,
     pub nir: u16,
+    pub extras: Box<[u8]>,
 }
 
 impl RawPoint {
-    pub const BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
+    /// Size of the fixed (non-extras) portion of the on-disk record.
+    pub const BASE_BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
 
-    #[allow(unused)]
-    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        let mut buf = [0u8; Self::BYTE_SIZE];
-        {
-            use std::io::Cursor;
-            let mut c = Cursor::new(&mut buf[..]);
-            c.write_i32::<LittleEndian>(self.x)?;
-            c.write_i32::<LittleEndian>(self.y)?;
-            c.write_i32::<LittleEndian>(self.z)?;
-            c.write_u16::<LittleEndian>(self.intensity)?;
-            c.write_u8(self.return_number)?;
-            c.write_u8(self.number_of_returns)?;
-            c.write_u8(self.classification)?;
-            c.write_i16::<LittleEndian>(self.scan_angle)?;
-            c.write_u8(self.user_data)?;
-            c.write_u16::<LittleEndian>(self.point_source_id)?;
-            c.write_f64::<LittleEndian>(self.gps_time)?;
-            c.write_u16::<LittleEndian>(self.red)?;
-            c.write_u16::<LittleEndian>(self.green)?;
-            c.write_u16::<LittleEndian>(self.blue)?;
-            c.write_u16::<LittleEndian>(self.nir)?;
-        }
-        w.write_all(&buf)?;
+    /// Total on-disk record size for the given extras width.
+    pub const fn record_size(num_extra_bytes: u16) -> usize {
+        Self::BASE_BYTE_SIZE + num_extra_bytes as usize
+    }
+
+    fn write_base_into(&self, c: &mut std::io::Cursor<&mut [u8]>) -> Result<()> {
+        c.write_i32::<LittleEndian>(self.x)?;
+        c.write_i32::<LittleEndian>(self.y)?;
+        c.write_i32::<LittleEndian>(self.z)?;
+        c.write_u16::<LittleEndian>(self.intensity)?;
+        c.write_u8(self.return_number)?;
+        c.write_u8(self.number_of_returns)?;
+        c.write_u8(self.classification)?;
+        c.write_i16::<LittleEndian>(self.scan_angle)?;
+        c.write_u8(self.user_data)?;
+        c.write_u16::<LittleEndian>(self.point_source_id)?;
+        c.write_f64::<LittleEndian>(self.gps_time)?;
+        c.write_u16::<LittleEndian>(self.red)?;
+        c.write_u16::<LittleEndian>(self.green)?;
+        c.write_u16::<LittleEndian>(self.blue)?;
+        c.write_u16::<LittleEndian>(self.nir)?;
+        c.write_all(&self.extras)?;
         Ok(())
     }
 
-    pub fn read<R: std::io::Read>(r: &mut R) -> Result<Self> {
-        let mut buf = [0u8; Self::BYTE_SIZE];
+    pub fn read<R: std::io::Read>(r: &mut R, num_extra_bytes: u16) -> Result<Self> {
+        let record_size = Self::record_size(num_extra_bytes);
+        let mut buf = vec![0u8; record_size];
         r.read_exact(&mut buf)?;
-        let mut c = std::io::Cursor::new(&buf[..]);
+        let (base, extras) = buf.split_at(Self::BASE_BYTE_SIZE);
+        let mut c = std::io::Cursor::new(base);
         Ok(RawPoint {
             x: c.read_i32::<LittleEndian>()?,
             y: c.read_i32::<LittleEndian>()?,
@@ -376,29 +385,29 @@ impl RawPoint {
             green: c.read_u16::<LittleEndian>()?,
             blue: c.read_u16::<LittleEndian>()?,
             nir: c.read_u16::<LittleEndian>()?,
+            extras: extras.to_vec().into_boxed_slice(),
         })
     }
 
     /// Write multiple points to a writer in a single bulk operation.
-    pub fn write_bulk<W: std::io::Write>(points: &[RawPoint], w: &mut W) -> Result<()> {
-        let mut buf = vec![0u8; Self::BYTE_SIZE * points.len()];
-        let mut c = std::io::Cursor::new(&mut buf[..]);
-        for p in points {
-            c.write_i32::<LittleEndian>(p.x)?;
-            c.write_i32::<LittleEndian>(p.y)?;
-            c.write_i32::<LittleEndian>(p.z)?;
-            c.write_u16::<LittleEndian>(p.intensity)?;
-            c.write_u8(p.return_number)?;
-            c.write_u8(p.number_of_returns)?;
-            c.write_u8(p.classification)?;
-            c.write_i16::<LittleEndian>(p.scan_angle)?;
-            c.write_u8(p.user_data)?;
-            c.write_u16::<LittleEndian>(p.point_source_id)?;
-            c.write_f64::<LittleEndian>(p.gps_time)?;
-            c.write_u16::<LittleEndian>(p.red)?;
-            c.write_u16::<LittleEndian>(p.green)?;
-            c.write_u16::<LittleEndian>(p.blue)?;
-            c.write_u16::<LittleEndian>(p.nir)?;
+    /// All points must carry exactly `num_extra_bytes` of extras.
+    pub fn write_bulk<W: std::io::Write>(
+        points: &[RawPoint],
+        num_extra_bytes: u16,
+        w: &mut W,
+    ) -> Result<()> {
+        let record_size = Self::record_size(num_extra_bytes);
+        let mut buf = vec![0u8; record_size * points.len()];
+        {
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            for p in points {
+                debug_assert_eq!(
+                    p.extras.len(),
+                    num_extra_bytes as usize,
+                    "RawPoint::write_bulk: extras length mismatch"
+                );
+                p.write_base_into(&mut c)?;
+            }
         }
         w.write_all(&buf)?;
         Ok(())
@@ -413,7 +422,11 @@ impl RawPoint {
 // files) is a sequence of zero or more *batches*. Each batch contains:
 //
 //     u32 LE point_count      (4 bytes)
-//     point_count × RawPoint  (38 bytes per point)
+//     point_count × RawPoint  (record_size = 38 + num_extra_bytes per point)
+//
+// The record size is parameterised by `num_extra_bytes` (carried by the
+// `OctreeBuilder`) so per-point Extra Bytes payloads can flow through the
+// pipeline without per-point allocation overhead beyond a single Box<[u8]>.
 //
 // - In `TempCompression::None` mode, batches are laid down directly in the
 //   file, back-to-back.
@@ -465,22 +478,23 @@ impl<R: std::io::Read> std::io::Read for MultiFrameReader<R> {
 }
 
 /// Write a single batch: a 4-byte little-endian point count followed by
-/// `points.len() × RawPoint::BYTE_SIZE` payload bytes. If `codec` is
-/// `Lz4`, the entire batch is encapsulated in a self-contained LZ4 frame.
+/// `points.len() × record_size` payload bytes. If `codec` is `Lz4`, the
+/// entire batch is encapsulated in a self-contained LZ4 frame.
 pub(crate) fn write_temp_batch<W: Write>(
     w: &mut W,
     points: &[RawPoint],
+    num_extra_bytes: u16,
     codec: TempCompression,
 ) -> Result<()> {
     match codec {
         TempCompression::None => {
             w.write_u32::<LittleEndian>(points.len() as u32)?;
-            RawPoint::write_bulk(points, w)?;
+            RawPoint::write_bulk(points, num_extra_bytes, w)?;
         }
         TempCompression::Lz4 => {
             let mut enc = lz4_flex::frame::FrameEncoder::new(w);
             enc.write_u32::<LittleEndian>(points.len() as u32)?;
-            RawPoint::write_bulk(points, &mut enc)?;
+            RawPoint::write_bulk(points, num_extra_bytes, &mut enc)?;
             enc.finish().context("finishing lz4 frame")?;
         }
     }
@@ -493,21 +507,22 @@ pub(crate) fn write_temp_batch<W: Write>(
 /// produces an empty Vec.
 pub(crate) fn read_temp_batches<R: std::io::Read>(
     r: R,
+    num_extra_bytes: u16,
     codec: TempCompression,
 ) -> Result<Vec<RawPoint>> {
     match codec {
-        TempCompression::None => read_batches_loop(&mut BufReader::new(r)),
+        TempCompression::None => read_batches_loop(&mut BufReader::new(r), num_extra_bytes),
         TempCompression::Lz4 => {
             let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
             let mut mf = MultiFrameReader { inner: dec };
-            read_batches_loop(&mut mf)
+            read_batches_loop(&mut mf, num_extra_bytes)
         }
     }
 }
 
-fn read_batches_loop<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
+fn read_batches_loop<R: std::io::Read>(r: &mut R, num_extra_bytes: u16) -> Result<Vec<RawPoint>> {
     let mut out: Vec<RawPoint> = Vec::new();
-    for_each_point_in_batches(r, |p| {
+    for_each_point_in_batches(r, num_extra_bytes, |p| {
         out.push(p);
         Ok(())
     })?;
@@ -521,6 +536,7 @@ fn read_batches_loop<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
 /// that would hold every point in the chunk resident at once.
 fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
     r: &mut R,
+    num_extra_bytes: u16,
     mut f: F,
 ) -> Result<()> {
     loop {
@@ -530,7 +546,7 @@ fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>
             Err(e) => return Err(e.into()),
         };
         for _ in 0..count {
-            f(RawPoint::read(r)?)?;
+            f(RawPoint::read(r, num_extra_bytes)?)?;
         }
     }
     Ok(())
@@ -540,15 +556,18 @@ fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>
 /// decoded `RawPoint` without ever materialising the full Vec.
 fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
     r: R,
+    num_extra_bytes: u16,
     codec: TempCompression,
     f: F,
 ) -> Result<()> {
     match codec {
-        TempCompression::None => for_each_point_in_batches(&mut BufReader::new(r), f),
+        TempCompression::None => {
+            for_each_point_in_batches(&mut BufReader::new(r), num_extra_bytes, f)
+        }
         TempCompression::Lz4 => {
             let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
             let mut mf = MultiFrameReader { inner: dec };
-            for_each_point_in_batches(&mut mf, f)
+            for_each_point_in_batches(&mut mf, num_extra_bytes, f)
         }
     }
 }
@@ -558,12 +577,17 @@ fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
 /// cheap way to skip a compressed payload, so we run the decoder and count
 /// headers (still cheaper than materialising all points — payload bytes are
 /// streamed through a throwaway sink). Returns 0 if the file does not exist.
-pub(crate) fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
+pub(crate) fn count_temp_file_points(
+    path: &Path,
+    num_extra_bytes: u16,
+    codec: TempCompression,
+) -> Result<u64> {
     let f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
+    let record_size = RawPoint::record_size(num_extra_bytes) as u64;
     match codec {
         TempCompression::None => {
             use std::io::{Seek, SeekFrom};
@@ -576,7 +600,7 @@ pub(crate) fn count_temp_file_points(path: &Path, codec: TempCompression) -> Res
                     Err(e) => return Err(e.into()),
                 };
                 total += count;
-                let payload = count * RawPoint::BYTE_SIZE as u64;
+                let payload = count * record_size;
                 f.seek(SeekFrom::Current(payload as i64))?;
             }
             Ok(total)
@@ -593,7 +617,7 @@ pub(crate) fn count_temp_file_points(path: &Path, codec: TempCompression) -> Res
                     Err(e) => return Err(e.into()),
                 };
                 total += count;
-                let mut remaining = count * RawPoint::BYTE_SIZE as u64;
+                let mut remaining = count * record_size;
                 while remaining > 0 {
                     let want = remaining.min(sink.len() as u64) as usize;
                     mf.read_exact(&mut sink[..want])?;
@@ -787,6 +811,13 @@ pub struct ScanResult {
     /// canonical WKT bytes are kept separately (see `OctreeBuilder::scan`
     /// return type) and only one copy lives through validate → write.
     pub wkt_crs_hash: Option<u64>,
+    /// Hash of the file's LAS Extra Bytes VLR payload (if present). Same
+    /// memory rationale as `wkt_crs_hash`: per-file we keep only the
+    /// hash; the canonical bytes live once in `ScanOutput`.
+    pub extra_bytes_vlr_hash: Option<u64>,
+    /// Trailing extra-byte width declared by this file's point format.
+    /// Must match across all files (enforced in validate).
+    pub num_extra_bytes: u16,
     pub point_format_id: u8,
 }
 
@@ -796,13 +827,17 @@ pub struct ScanResult {
 pub struct ScanOutput {
     pub results: Vec<ScanResult>,
     pub canonical_wkt: Option<Vec<u8>>,
+    /// Canonical LAS Extra Bytes VLR payload from the first file that had
+    /// one. `None` when no input declares extra bytes. Validated to be
+    /// byte-identical across all input files.
+    pub canonical_extra_bytes_vlr: Option<Vec<u8>>,
 }
 
-/// Stable 64-bit hash of a WKT byte payload. SipHash-1-3 with a fixed
-/// seed so the digest is identical across files in the same process.
-/// Collisions would cause a silent CRS mismatch; with 64 bits and
-/// typically <10 distinct WKTs per run the risk is negligible.
-fn wkt_hash(bytes: &[u8]) -> u64 {
+/// Stable 64-bit hash of a byte payload. SipHash-1-3 with a fixed seed
+/// so digests are identical across files in the same process. With 64
+/// bits and typically a single VLR per kind per run, collision risk is
+/// negligible. Used for both WKT CRS and Extra Bytes VLR identity.
+fn bytes_hash(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
     let mut h = BuildHasherDefault::<DefaultHasher>::default().build_hasher();
@@ -840,6 +875,14 @@ pub struct OctreeBuilder {
     pub tmp_dir: PathBuf,
     /// WKT CRS payload from the first input file (if present).
     pub wkt_crs: Option<Vec<u8>>,
+    /// LAS Extra Bytes VLR payload (user_id=LASF_Spec, record_id=4) from
+    /// the first input file (if present). All input files share this VLR
+    /// (validated upstream); a single canonical copy lives here and is
+    /// re-emitted into the output COPC unchanged.
+    pub extra_bytes_vlr: Option<Vec<u8>>,
+    /// Trailing extra-byte width of every point record. Zero when the
+    /// inputs declare no extras. Validated to be uniform across input files.
+    pub num_extra_bytes: u16,
     /// COPC output point format (6, 7, or 8), derived from input files.
     pub point_format: u8,
     /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
@@ -854,18 +897,21 @@ pub struct OctreeBuilder {
 impl OctreeBuilder {
     /// Pass 1: scan all files in parallel to get bounds and total point count.
     ///
-    /// Each file's WKT CRS bytes are hashed on the fly; only the first
-    /// file's canonical WKT payload is kept in full. Downstream validate
-    /// compares hashes and uses the canonical payload for the output COPC.
+    /// Each file's WKT CRS bytes and Extra Bytes VLR bytes are hashed on
+    /// the fly; only the first file's canonical payloads are kept in full.
+    /// Downstream validate compares hashes and uses the canonical payloads
+    /// for the output COPC.
     pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<ScanOutput> {
+        // (ScanResult, wkt_bytes, extra_bytes_vlr) — the trailing Options
+        // carry raw VLR bytes so we can pick the first non-None ones after
+        // the parallel scan. Post-aggregation we drop every per-file Vec
+        // and keep only one canonical copy of each.
+        type PerFileEntry = (ScanResult, Option<Vec<u8>>, Option<Vec<u8>>);
+
         let done = std::sync::atomic::AtomicU64::new(0);
-        // Per-file result: (ScanResult, Option<Vec<u8>>) — the Option carries
-        // the raw WKT bytes so we can pick the first non-None one after the
-        // parallel scan. Post-aggregation we drop every per-file Vec and
-        // keep only the single canonical copy.
-        let per_file: Result<Vec<(ScanResult, Option<Vec<u8>>)>> = input_files
+        let per_file: Result<Vec<PerFileEntry>> = input_files
             .par_iter()
-            .map(|path| -> Result<(ScanResult, Option<Vec<u8>>)> {
+            .map(|path| -> Result<PerFileEntry> {
                 debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
@@ -881,7 +927,13 @@ impl OctreeBuilder {
                     .all_vlrs()
                     .find(|v| v.is_wkt_crs())
                     .map(|v| v.data.clone());
-                let wkt_crs_hash = wkt_bytes.as_deref().map(wkt_hash);
+                let wkt_crs_hash = wkt_bytes.as_deref().map(bytes_hash);
+                let extra_bytes_vlr: Option<Vec<u8>> = hdr
+                    .all_vlrs()
+                    .find(|v| v.user_id.trim_end_matches('\0') == "LASF_Spec" && v.record_id == 4)
+                    .map(|v| v.data.clone());
+                let extra_bytes_vlr_hash = extra_bytes_vlr.as_deref().map(bytes_hash);
+                let num_extra_bytes = hdr.point_format().extra_bytes;
                 Ok((
                     ScanResult {
                         bounds,
@@ -893,27 +945,37 @@ impl OctreeBuilder {
                         offset_y: t.y.offset,
                         offset_z: t.z.offset,
                         wkt_crs_hash,
+                        extra_bytes_vlr_hash,
+                        num_extra_bytes,
                         point_format_id: hdr.point_format().to_u8().unwrap_or(0),
                     },
                     wkt_bytes,
+                    extra_bytes_vlr,
                 ))
             })
             .collect();
 
         let per_file = per_file?;
         let mut canonical_wkt: Option<Vec<u8>> = None;
+        let mut canonical_extra_bytes_vlr: Option<Vec<u8>> = None;
         let mut results: Vec<ScanResult> = Vec::with_capacity(per_file.len());
-        for (sr, wkt) in per_file {
+        for (sr, wkt, eb) in per_file {
             if canonical_wkt.is_none()
                 && let Some(bytes) = wkt
             {
                 canonical_wkt = Some(bytes);
+            }
+            if canonical_extra_bytes_vlr.is_none()
+                && let Some(bytes) = eb
+            {
+                canonical_extra_bytes_vlr = Some(bytes);
             }
             results.push(sr);
         }
         Ok(ScanOutput {
             results,
             canonical_wkt,
+            canonical_extra_bytes_vlr,
         })
     }
 
@@ -961,12 +1023,16 @@ impl OctreeBuilder {
         }
         std::fs::create_dir_all(&tmp_dir)?;
 
+        let num_extra_bytes = validated.num_extra_bytes;
         let node_store: Arc<dyn NodeStore> = match config.node_storage {
-            crate::NodeStorage::Files => {
-                Arc::new(FileNodeStore::new(tmp_dir.clone(), config.temp_compression))
-            }
+            crate::NodeStorage::Files => Arc::new(FileNodeStore::new(
+                tmp_dir.clone(),
+                num_extra_bytes,
+                config.temp_compression,
+            )),
             crate::NodeStorage::Packed => Arc::new(PackedNodeStore::new(
                 &tmp_dir,
+                num_extra_bytes,
                 config.temp_compression,
                 rayon::current_num_threads().max(1),
             )?),
@@ -987,6 +1053,8 @@ impl OctreeBuilder {
             offset_z,
             tmp_dir,
             wkt_crs: validated.wkt_crs.clone(),
+            extra_bytes_vlr: validated.extra_bytes_vlr.clone(),
+            num_extra_bytes,
             point_format: validated.point_format,
             chunked_plan: None,
             temp_compression: config.temp_compression,
@@ -1005,6 +1073,23 @@ impl OctreeBuilder {
         let ix = ((p.x - self.offset_x) / self.scale_x).round() as i32;
         let iy = ((p.y - self.offset_y) / self.scale_y).round() as i32;
         let iz = ((p.z - self.offset_z) / self.scale_z).round() as i32;
+        let extras = if self.num_extra_bytes == 0 {
+            Box::<[u8]>::default()
+        } else {
+            // Validate matches the per-file header against the canonical
+            // count, so the only way to land here with a wrong length is
+            // a corrupt file. Pad-or-truncate to keep the pipeline going
+            // and surface a single warning rather than aborting.
+            let want = self.num_extra_bytes as usize;
+            if p.extra_bytes.len() == want {
+                p.extra_bytes.clone().into_boxed_slice()
+            } else {
+                let mut buf = vec![0u8; want];
+                let n = p.extra_bytes.len().min(want);
+                buf[..n].copy_from_slice(&p.extra_bytes[..n]);
+                buf.into_boxed_slice()
+            }
+        };
         RawPoint {
             x: ix,
             y: iy,
@@ -1021,6 +1106,7 @@ impl OctreeBuilder {
             green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
             blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
             nir: p.nir.unwrap_or(0),
+            extras,
         }
     }
 
@@ -1074,7 +1160,8 @@ impl OctreeBuilder {
                 "In-memory level {d}: {} total points at child level, {} nodes in map ({} MB est)",
                 level_points,
                 nodes.len(),
-                (nodes.values().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<RawPoint>())
+                (nodes.values().map(|v| v.len()).sum::<usize>()
+                    * (std::mem::size_of::<RawPoint>() + self.num_extra_bytes as usize))
                     / 1_048_576,
             );
 
@@ -1298,13 +1385,18 @@ impl OctreeBuilder {
         let per_worker_cap = (CHUNKED_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
 
         // Per-worker memory budget for the input chunk size. The transient
-        // peak is `Vec<las::Point>` (~120 B/pt) plus the cache's BufWriter
-        // overhead (negligible). Size for 1/8 of the per-worker budget so
-        // there's headroom for the LAZ decoder + grouping overhead.
-        const BYTES_PER_POINT_TRANSIENT: u64 = 120;
+        // peak is `Vec<las::Point>` (~120 B/pt for format 3) plus the cache's
+        // BufWriter overhead (negligible) plus the per-point Extra Bytes
+        // payloads (`las::Point.extra_bytes` carries `num_extra_bytes`
+        // bytes that don't appear in `size_of::<las::Point>`). Size for
+        // 1/8 of the per-worker budget so there's headroom for the LAZ
+        // decoder + grouping overhead.
+        const BASE_BYTES_PER_POINT_TRANSIENT: u64 = 120;
+        let bytes_per_point_transient =
+            BASE_BYTES_PER_POINT_TRANSIENT + self.num_extra_bytes as u64;
         let per_worker_budget = config.memory_budget / num_workers as u64;
         let read_chunk_size =
-            ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
+            ((per_worker_budget / 8) / bytes_per_point_transient).clamp(50_000, 2_000_000) as usize;
 
         debug!(
             "Distribute: budget={} MB, workers={}, read_chunk_size={}, open-file cap={} (per worker)",
@@ -1352,7 +1444,11 @@ impl OctreeBuilder {
                     return Ok(());
                 }
 
-                let mut cache = ChunkWriterCache::new(per_worker_cap, self.temp_compression);
+                let mut cache = ChunkWriterCache::new(
+                    per_worker_cap,
+                    self.num_extra_bytes,
+                    self.temp_compression,
+                );
                 let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
                 // Group buffer reused across batches so capacity amortizes.
                 // Drained at the end of each batch so retained Vec capacity
@@ -1454,7 +1550,7 @@ impl OctreeBuilder {
     ) -> Result<()> {
         let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
         let file = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
-        stream_temp_batches(file, self.temp_compression, f)
+        stream_temp_batches(file, self.num_extra_bytes, self.temp_compression, f)
     }
 
     /// Build a single chunk's sub-octree fully in memory and write its node
@@ -1675,9 +1771,16 @@ impl OctreeBuilder {
         );
 
         // Reuse the same per-point cost estimate as bottom_up_on_disk's
-        // small-parent batching: input vec + per-child remaining.
-        const MEM_PER_POINT: u64 =
-            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
+        // small-parent batching: input vec + per-child remaining. The
+        // `2 * num_extra_bytes` term accounts for the heap-allocated
+        // extras payloads (`Box<[u8]>`) — `size_of::<RawPoint>` only
+        // counts the box header, not the bytes it points at, so without
+        // this term the budget gate under-reports by
+        // `num_extra_bytes` × points for each of the two `RawPoint`
+        // instances per point.
+        let mem_per_point: u64 = (std::mem::size_of::<(usize, RawPoint)>()
+            + std::mem::size_of::<RawPoint>()) as u64
+            + 2 * self.num_extra_bytes as u64;
 
         let mut all_new_parents: Vec<VoxelKey> = Vec::new();
 
@@ -1716,7 +1819,7 @@ impl OctreeBuilder {
                     .iter()
                     .map(|ck| self.count_node(ck).unwrap_or(0))
                     .sum();
-                let est_mem = est_points * MEM_PER_POINT;
+                let est_mem = est_points * mem_per_point;
                 if est_mem > config.memory_budget {
                     large_parents.push((parent, children, est_mem));
                 } else {
@@ -2038,16 +2141,24 @@ mod tests {
             green: 0,
             blue: 65535,
             nir: 32768,
+            extras: Box::<[u8]>::default(),
         }
     }
 
+    fn sample_point_with_extras(extras: &[u8]) -> RawPoint {
+        let mut p = sample_point();
+        p.extras = extras.to_vec().into_boxed_slice();
+        p
+    }
+
+    /// Round-trip a single point through write_bulk + read.
     #[test]
     fn rawpoint_roundtrip_single() {
         let p = sample_point();
         let mut buf = Vec::new();
-        p.write(&mut buf).unwrap();
-        assert_eq!(buf.len(), RawPoint::BYTE_SIZE);
-        let p2 = RawPoint::read(&mut &buf[..]).unwrap();
+        RawPoint::write_bulk(std::slice::from_ref(&p), 0, &mut buf).unwrap();
+        assert_eq!(buf.len(), RawPoint::record_size(0));
+        let p2 = RawPoint::read(&mut &buf[..], 0).unwrap();
         assert_eq!(p.x, p2.x);
         assert_eq!(p.y, p2.y);
         assert_eq!(p.z, p2.z);
@@ -2063,6 +2174,7 @@ mod tests {
         assert_eq!(p.green, p2.green);
         assert_eq!(p.blue, p2.blue);
         assert_eq!(p.nir, p2.nir);
+        assert_eq!(&*p.extras, &*p2.extras);
     }
 
     #[test]
@@ -2085,21 +2197,70 @@ mod tests {
                 green: 0,
                 blue: 0,
                 nir: 0,
+                extras: Box::<[u8]>::default(),
             },
             sample_point(),
         ];
 
         let mut buf = Vec::new();
-        RawPoint::write_bulk(&points, &mut buf).unwrap();
-        assert_eq!(buf.len(), RawPoint::BYTE_SIZE * 3);
+        RawPoint::write_bulk(&points, 0, &mut buf).unwrap();
+        assert_eq!(buf.len(), RawPoint::record_size(0) * 3);
 
         // Read them back one at a time
         let mut cursor = std::io::Cursor::new(&buf[..]);
         for orig in &points {
-            let p = RawPoint::read(&mut cursor).unwrap();
+            let p = RawPoint::read(&mut cursor, 0).unwrap();
             assert_eq!(orig.x, p.x);
             assert_eq!(orig.gps_time, p.gps_time);
             assert_eq!(orig.nir, p.nir);
+        }
+    }
+
+    /// Round-trip points with trailing extras: every byte must survive
+    /// the bulk write + per-point read path.
+    #[test]
+    fn rawpoint_roundtrip_with_extras() {
+        let extras_a = b"\xAA\xBB\xCC\xDD\xEE\xFF\x00\x11\x22\x33\x44\x55";
+        let extras_b = b"\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE\x01\x02\x03\x04";
+        let extras_c = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let num = 12u16;
+
+        let points = vec![
+            sample_point_with_extras(extras_a),
+            sample_point_with_extras(extras_b),
+            sample_point_with_extras(extras_c),
+        ];
+
+        let mut buf = Vec::new();
+        RawPoint::write_bulk(&points, num, &mut buf).unwrap();
+        assert_eq!(buf.len(), RawPoint::record_size(num) * 3);
+
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let decoded: Vec<RawPoint> = (0..3)
+            .map(|_| RawPoint::read(&mut cursor, num).unwrap())
+            .collect();
+        assert_eq!(&*decoded[0].extras, extras_a);
+        assert_eq!(&*decoded[1].extras, extras_b);
+        assert_eq!(&*decoded[2].extras, extras_c);
+    }
+
+    /// Stream round-trip with extras through write_temp_batch +
+    /// read_temp_batches under both compression codecs.
+    #[test]
+    fn temp_batch_roundtrip_with_extras() {
+        let num = 8u16;
+        let points: Vec<RawPoint> = (0..5)
+            .map(|i| sample_point_with_extras(&[i as u8; 8]))
+            .collect();
+
+        for codec in [crate::TempCompression::None, crate::TempCompression::Lz4] {
+            let mut buf = Vec::new();
+            write_temp_batch(&mut buf, &points, num, codec).unwrap();
+            let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), num, codec).unwrap();
+            assert_eq!(decoded.len(), points.len());
+            for (orig, got) in points.iter().zip(decoded.iter()) {
+                assert_eq!(&*orig.extras, &*got.extras, "extras must survive {codec:?}");
+            }
         }
     }
 
@@ -2125,10 +2286,10 @@ mod tests {
 
         let mut buf: Vec<u8> = Vec::new();
         for batch in &batches {
-            write_temp_batch(&mut buf, batch, codec).unwrap();
+            write_temp_batch(&mut buf, batch, 0, codec).unwrap();
         }
 
-        let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), codec).unwrap();
+        let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), 0, codec).unwrap();
         assert_eq!(
             decoded.len(),
             expected,
@@ -2153,28 +2314,22 @@ mod tests {
         {
             let mut f = BufWriter::new(File::create(&tmp).unwrap());
             for batch in &batches {
-                write_temp_batch(&mut f, batch, codec).unwrap();
+                write_temp_batch(&mut f, batch, 0, codec).unwrap();
             }
             f.flush().unwrap();
         }
-        let got = count_temp_file_points(&tmp, codec).unwrap();
+        let got = count_temp_file_points(&tmp, 0, codec).unwrap();
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(got, expected, "multi-frame count must match total");
     }
 
     #[test]
-    fn rawpoint_bulk_matches_single() {
-        let p = sample_point();
-        let mut single_buf = Vec::new();
-        p.write(&mut single_buf).unwrap();
-
-        let mut bulk_buf = Vec::new();
-        RawPoint::write_bulk(std::slice::from_ref(&p), &mut bulk_buf).unwrap();
-
-        assert_eq!(
-            single_buf, bulk_buf,
-            "bulk write must produce identical bytes to single write"
-        );
+    fn rawpoint_record_size_arithmetic() {
+        // Base record is 38 bytes; extras shift the total by exactly the
+        // declared width.
+        assert_eq!(RawPoint::record_size(0), 38);
+        assert_eq!(RawPoint::record_size(12), 50);
+        assert_eq!(RawPoint::record_size(255), 38 + 255);
     }
 
     #[test]
