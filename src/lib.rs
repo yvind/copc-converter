@@ -27,6 +27,7 @@
 //! ```
 
 pub(crate) mod copc_types;
+pub(crate) mod extra_bytes;
 pub(crate) mod node_store;
 pub(crate) mod octree;
 pub(crate) mod validate;
@@ -67,16 +68,23 @@ pub enum Error {
         file_b: PathBuf,
     },
 
-    /// Input files have mismatched LAS Extra Bytes schemas. All inputs
-    /// must declare an identical Extra Bytes VLR and the same trailing
-    /// byte count per point — otherwise the merged COPC would advertise
-    /// a schema that doesn't apply uniformly to its point data.
-    #[error("Extra Bytes mismatch: {file_a:?} has a different Extra Bytes schema than {file_b:?}")]
+    /// Input files have mismatched LAS Extra Bytes *schemas*. Per-file
+    /// stats (min/max/no_data) are merged honestly into the output VLR
+    /// and never cause this error — only the structural parts of the
+    /// schema (field count, names, data types, descriptions, scale,
+    /// offset, no_data values, and the scale/offset option bits) must
+    /// agree across all inputs. `detail` enumerates every structural
+    /// difference between the reference file (`file_a`, the first
+    /// scanned file with extras) and the offending file (`file_b`).
+    #[error("Extra Bytes schema mismatch between {file_a:?} (reference) and {file_b:?}:\n{detail}")]
     ExtraBytesMismatch {
-        /// Path of the first file.
+        /// Path of the reference file (first scanned file with extras).
         file_a: PathBuf,
         /// Path of the differing file.
         file_b: PathBuf,
+        /// Human-readable list of every structural difference between
+        /// the two files' Extra Bytes schemas, one per line.
+        detail: String,
     },
 
     /// Input files have mismatched point formats.

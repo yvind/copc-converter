@@ -1428,3 +1428,77 @@ fn extra_bytes_per_point_payload_round_trips() {
 
     let _ = std::fs::remove_file(output);
 }
+
+/// Two real input files declare structurally incompatible Extra Bytes
+/// schemas (different field counts, different `treeId` data type). The
+/// converter must surface this via `Error::ExtraBytesMismatch` with a
+/// `detail` enumerating every difference — and must reference the
+/// canonical input as `file_a`, not the offending one.
+///
+/// Source files: tests/data/extra_bytes_input.laz (4 fields:
+/// treeId u16, semantic u8, bisemantic u8, zNorm f64) and
+/// tests/data/extra_bytes_mismatched.laz (2 fields: treeId u32, zNorm
+/// f64) — both are real LAS 1.4 tiles from the same upstream pipeline.
+#[test]
+fn extra_bytes_schema_mismatch_reports_all_differences() {
+    let canonical = Path::new("tests/data/extra_bytes_input.laz");
+    let mismatched = Path::new("tests/data/extra_bytes_mismatched.laz");
+
+    // Build a temp input directory holding both fixtures so the
+    // converter scans them as a multi-file batch.
+    let tmp_dir = std::env::temp_dir().join(format!("copc_extras_mismatch_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let canonical_in = tmp_dir.join("a_canonical.laz");
+    let mismatched_in = tmp_dir.join("b_mismatched.laz");
+    std::fs::copy(canonical, &canonical_in).unwrap();
+    std::fs::copy(mismatched, &mismatched_in).unwrap();
+
+    let output = tmp_dir.join("out.copc.laz");
+    let result = Command::new(converter_bin())
+        .arg(&tmp_dir)
+        .arg(&output)
+        .args(["--progress", "plain"])
+        .output()
+        .expect("failed to run copc_converter");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    assert!(
+        !result.status.success(),
+        "converter should fail when input files have mismatched extras schemas"
+    );
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let combined = format!("{stderr}\n{}", String::from_utf8_lossy(&result.stdout));
+
+    // The two failure modes that must appear in the detail block:
+    //   - field count differs (4 vs 2, includes the missing field names)
+    //   - per-field data_type / option / etc. diffs not relevant here
+    //     because field count short-circuits the per-field walk.
+    assert!(
+        combined.contains("Extra Bytes schema mismatch"),
+        "expected ExtraBytesMismatch error header in output, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("field count differs"),
+        "expected 'field count differs' line in detail, got:\n{combined}"
+    );
+    // The 4-field canonical names must appear so the user can see what
+    // they're missing in the offending file.
+    assert!(
+        combined.contains("semantic") && combined.contains("bisemantic"),
+        "expected canonical field names listed in error, got:\n{combined}"
+    );
+    // The reference file should be the canonical one (first scanned
+    // with extras), not the offender.
+    let canonical_idx = combined.find("a_canonical.laz");
+    let mismatched_idx = combined.find("b_mismatched.laz");
+    assert!(
+        canonical_idx.is_some() && mismatched_idx.is_some(),
+        "both file paths must appear in the error, got:\n{combined}"
+    );
+    assert!(
+        canonical_idx.unwrap() < mismatched_idx.unwrap(),
+        "canonical file must be named first (as the reference), got:\n{combined}"
+    );
+}

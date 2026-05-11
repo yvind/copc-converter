@@ -811,10 +811,18 @@ pub struct ScanResult {
     /// canonical WKT bytes are kept separately (see `OctreeBuilder::scan`
     /// return type) and only one copy lives through validate → write.
     pub wkt_crs_hash: Option<u64>,
-    /// Hash of the file's LAS Extra Bytes VLR payload (if present). Same
-    /// memory rationale as `wkt_crs_hash`: per-file we keep only the
-    /// hash; the canonical bytes live once in `ScanOutput`.
-    pub extra_bytes_vlr_hash: Option<u64>,
+    /// Parsed Extra Bytes VLR — structural fields + per-file stats.
+    /// `None` when the file declares no extra bytes. Keeping the parsed
+    /// form per file (a few hundred bytes per file) costs more than a
+    /// single hash but lets validate produce rich per-field diff
+    /// messages on mismatch and lets the writer merge stats honestly
+    /// across all inputs without re-reading the VLR.
+    pub(crate) extra_bytes_parsed: Option<crate::extra_bytes::ParsedExtraBytes>,
+    /// Hash of the file's Extra Bytes VLR *schema* (structural fields
+    /// only, with per-file stats excluded). Used as the fast equality
+    /// check across files; identical hashes mean the per-point bytes
+    /// can be interpreted with a single canonical schema.
+    pub extra_bytes_schema_hash: Option<u64>,
     /// Trailing extra-byte width declared by this file's point format.
     /// Must match across all files (enforced in validate).
     pub num_extra_bytes: u16,
@@ -932,7 +940,16 @@ impl OctreeBuilder {
                     .all_vlrs()
                     .find(|v| v.user_id.trim_end_matches('\0') == "LASF_Spec" && v.record_id == 4)
                     .map(|v| v.data.clone());
-                let extra_bytes_vlr_hash = extra_bytes_vlr.as_deref().map(bytes_hash);
+                let extra_bytes_parsed = match &extra_bytes_vlr {
+                    Some(bytes) => Some(
+                        crate::extra_bytes::ParsedExtraBytes::parse(bytes)
+                            .with_context(|| format!("parsing Extra Bytes VLR in {path:?}"))?,
+                    ),
+                    None => None,
+                };
+                let extra_bytes_schema_hash = extra_bytes_parsed
+                    .as_ref()
+                    .map(crate::extra_bytes::schema_hash);
                 let num_extra_bytes = hdr.point_format().extra_bytes;
                 Ok((
                     ScanResult {
@@ -945,7 +962,8 @@ impl OctreeBuilder {
                         offset_y: t.y.offset,
                         offset_z: t.z.offset,
                         wkt_crs_hash,
-                        extra_bytes_vlr_hash,
+                        extra_bytes_parsed,
+                        extra_bytes_schema_hash,
                         num_extra_bytes,
                         point_format_id: hdr.point_format().to_u8().unwrap_or(0),
                     },
