@@ -11,7 +11,8 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 - Merges multiple input files into a single COPC output
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
 - Parallel reading, octree construction, and LAZ compression via rayon
-- Preserves WKT CRS from input files
+- Preserves WKT and GeoTIFF CRS from input files (GeoTIFF EPSG codes are translated to WKT for the output)
+- Preserves LAS Extra Bytes (per-point user-defined attributes such as classification probabilities, intensity ratios, or producer-specific labels) end-to-end, with per-file min/max stats merged honestly into the output VLR
 - Optional temporal index for GPS-time-based filtering ([spec](https://github.com/360-geo/copc/blob/master/copc-temporal/docs/temporal-index-spec.md))
 
 ## Installation
@@ -115,7 +116,9 @@ copc_converter ./my_survey/ survey.copc.laz --temporal-index
 The crate exposes a typestate pipeline API that enforces correct step ordering at compile time:
 
 ```rust
-use copc_converter::{Pipeline, PipelineConfig, collect_input_files};
+use copc_converter::{
+    NodeStorage, Pipeline, PipelineConfig, TempCompression, collect_input_files,
+};
 
 let files = collect_input_files("./tiles/".into())?;
 let config = PipelineConfig {
@@ -125,6 +128,8 @@ let config = PipelineConfig {
     temporal_stride: 1000,
     progress: None, // or Some(Arc::new(your_observer))
     chunk_target_override: None,
+    temp_compression: TempCompression::None,
+    node_storage: NodeStorage::Files,
 };
 
 Pipeline::scan(&files, config)?
@@ -168,10 +173,10 @@ Prints chunk count, target size, grid resolution, and per-chunk size distributio
 
 ## How it works
 
-1. **Scan** — reads headers from all input files in parallel to determine bounds, CRS, point format, and point count.
-2. **Validate** — checks that all input files share the same CRS and point format, and selects the appropriate COPC output format (6, 7, or 8).
+1. **Scan** — reads headers from all input files in parallel to determine bounds, point count, point format, CRS (WKT or GeoTIFF), and any LAS Extra Bytes schema.
+2. **Validate** — checks that all input files share the same CRS, point format, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
 3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into thousands of roughly equal-sized chunks via counting sort.
-4. **Distribute** — second full pass over the input: streams every point into its chunk's scratch file on disk, bounded by the configured memory budget.
+4. **Distribute** — second full pass over the input: streams every point (including any trailing Extra Bytes) into its chunk's scratch file on disk, bounded by the configured memory budget.
 5. **Build** — each chunk's sub-octree is built independently in memory in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs.
 6. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
 

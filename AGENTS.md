@@ -33,10 +33,14 @@ Pipeline::scan(&files, config)?  -> Pipeline<Scanned>
 |---|---|
 | `lib.rs` | Public API: `Pipeline<S>`, `PipelineConfig`, stage markers, utility functions |
 | `main.rs` | CLI args (clap), calls the pipeline |
-| `octree.rs` | `OctreeBuilder`, voxel key math, point distribution, octree construction |
-| `validate.rs` | Input validation (CRS, point format, GPS time) |
+| `octree.rs` | `OctreeBuilder`, voxel key math, point distribution, octree construction; CRS detection (WKT + GeoTIFF) at scan time |
+| `validate.rs` | Input validation (CRS, point format, GPS time, Extra Bytes schema) and stat merging across input files |
 | `writer.rs` | COPC file writer with parallel LAZ encoding |
 | `copc_types.rs` | COPC-specific structs (header, VLRs, hierarchy entries, temporal index) |
+| `extra_bytes.rs` | LAS Extra Bytes VLR parsing, schema-vs-stats split, structural diff, stat merging |
+| `node_store.rs` | Per-node point-data storage backends (`FileNodeStore`, `PackedNodeStore`) used during build |
+| `chunking.rs` | Hierarchical counting-sort chunk planner (Schütz et al. 2020) used during distribute |
+| `tools/` | Optional HTTP source adapter for `inspect_copc`, gated behind the `tools` feature |
 
 ### Key design decisions
 
@@ -46,8 +50,13 @@ Pipeline::scan(&files, config)?  -> Pipeline<Scanned>
 - **Temp cleanup**: `OctreeBuilder` implements `Drop` to remove the temp directory, ensuring cleanup even on error
 - **Point formats**: automatically selects LAS point format 6, 7, or 8 based on input — uses the `las` crate for reading and `laz` for compression
 - **Parallelism**: uses rayon throughout for reading, octree building, and LAZ compression
-- **LOD thinning**: 128 grid cells per axis (matching untwine's CellCount) for good progressive rendering
+- **LOD thinning**: 128 grid cells per axis (matching untwine's CellCount) for good progressive rendering, declared in the spec-mandated `CopcInfo.spacing` as `2 × halfsize / 128`
+- **CRS detection**: WKT VLRs are preferred; if absent, GeoTIFF EPSG codes are translated to WKT via the `crs-definitions` registry. Cross-format mismatches are caught via a best-effort trailing-EPSG parse on the WKT side
+- **LAS Extra Bytes pass-through**: per-point trailing bytes and the Extra Bytes VLR are preserved end-to-end. Validation compares only the *structural* parts of the schema across inputs (field count, types, scale/offset) — per-file min/max/no_data stats are merged honestly (union of mins and maxes) into the output VLR
+- **Node storage backends**: build-stage point data goes to either one file per octree node (`FileNodeStore`, default) or a small number of append-only pack files with an in-memory index (`PackedNodeStore`) when filesystem inode budgets matter
+- **Temp compression**: scratch batches can be wrapped in self-contained LZ4 frames (`TempCompression::Lz4`) to cut disk footprint on network filesystems
 - **Version in Cargo.toml**: kept as `0.0.0-dev`; CI patches it from the git tag at release time
+- **Published crate excludes `tests/data/*`**: real-LAS test fixtures push the tarball over crates.io's 10 MiB limit. The lib still builds + tests-from-git, just not from the published tarball
 
 ## Development
 
