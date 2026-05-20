@@ -73,7 +73,13 @@ CI runs all three on every push to `master` and on PRs. All must pass.
 1. Move `## [Unreleased]` entries in `CHANGELOG.md` into a new `## [X.Y.Z] - YYYY-MM-DD` section and update the link references at the bottom. Leave an empty `## [Unreleased]` heading at the top for the next cycle.
 2. Commit and push to `master`
 3. Create and push a git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-4. Create a GitHub Release: `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes`
+4. Create a GitHub Release using the new CHANGELOG section as the body, with the auto-generated compare link appended:
+   ```sh
+   # Extract the [X.Y.Z] section (everything between its heading and the next ## heading) into a temp file:
+   awk '/^## \[X\.Y\.Z\]/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md > /tmp/release-notes.md
+   gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file /tmp/release-notes.md
+   ```
+   `--notes-file` provides the body; `--generate-notes` appends the `**Full Changelog**: …compare/…` link (and, on tags with multiple commits, a per-commit list).
 5. CI triggers on the release event and automatically:
    - Builds binaries for linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64)
    - Publishes to crates.io
