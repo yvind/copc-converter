@@ -122,7 +122,7 @@ pub struct ChunkPlan {
 /// round-tripped point coordinates observed during counting.
 ///
 /// Each tuple is `(header_value, actual_value)`. Only axes whose absolute
-/// difference exceeds one scale unit are populated; the rest are `None`.
+/// difference exceeds 1.5 scale units are populated; the rest are `None`.
 #[derive(Debug, Clone, Copy)]
 pub struct HeaderBoundsMismatch {
     pub min_x: Option<(f64, f64)>,
@@ -307,18 +307,22 @@ pub(crate) fn compute_chunk_plan(
 // ---------------------------------------------------------------------------
 
 /// Compare the LAS header bounds to the actual point data observed during
-/// counting, returning a [`HeaderBoundsMismatch`] if any axis exceeds one
-/// scale unit of tolerance. The CLI surfaces any mismatch as a warning so
+/// counting, returning a [`HeaderBoundsMismatch`] if any axis exceeds 1.5
+/// scale units of tolerance. The CLI surfaces any mismatch as a warning so
 /// users know their input headers are inaccurate.
 fn detect_header_mismatch(
     builder: &OctreeBuilder,
     actual: &ActualBounds,
 ) -> Option<HeaderBoundsMismatch> {
-    // Tolerance: one scale unit per axis. Stored point coordinates are
-    // `int32 × scale + offset`, so this is the finest difference that can
-    // be real rather than an artefact of float round-tripping.
-    let flag = |hdr: f64, act: f64, tol: f64| -> Option<(f64, f64)> {
-        ((hdr - act).abs() > tol).then_some((hdr, act))
+    // Tolerance: 1.5 scale units per axis. Stored point coordinates are
+    // `int32 × scale + offset`, so one scale unit is the finest difference
+    // that can be real — but float round-tripping of header bounds
+    // routinely overshoots one scale unit by a few ULPs. The extra half
+    // unit absorbs that noise and the common case of header bounds rounded
+    // to one more decimal than the point precision, while still flagging
+    // any genuine ≥2-unit disagreement.
+    let flag = |hdr: f64, act: f64, scale: f64| -> Option<(f64, f64)> {
+        ((hdr - act).abs() > 1.5 * scale).then_some((hdr, act))
     };
     let hdr = &builder.bounds;
     let result = HeaderBoundsMismatch {

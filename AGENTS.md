@@ -70,11 +70,16 @@ CI runs all three on every push to `master` and on PRs. All must pass.
 
 ## Releasing
 
-1. Commit and push to `master`
-2. Create and push a git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-3. Create a GitHub Release: `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes`
-4. CI triggers on the release event and automatically:
+1. Move `## [Unreleased]` entries in `CHANGELOG.md` into a new `## [X.Y.Z] - YYYY-MM-DD` section and update the link references at the bottom. Leave an empty `## [Unreleased]` heading at the top for the next cycle.
+2. Commit and push to `master`
+3. Create and push a git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
+4. Create a GitHub Release: `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes`
+5. CI triggers on the release event and automatically:
    - Builds binaries for linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64)
    - Publishes to crates.io
 
-**Important:** A git tag alone is not enough — the CI workflows trigger on `release: [published]`, so the GitHub Release (step 3) is required.
+**Important:** A git tag alone is not enough — the CI workflows trigger on `release: [published]`, so the GitHub Release (step 4) is required.
+
+## Changelog
+
+User-visible changes go in `CHANGELOG.md` under `## [Unreleased]` as part of the same commit that makes the change. Use Keep a Changelog groups (`Added`, `Changed`, `Fixed`, `Removed`, `Deprecated`, `Security`). Skip internal-only changes (refactors, test infra, dep bumps that don't affect users).
